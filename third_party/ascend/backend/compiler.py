@@ -678,16 +678,7 @@ def _parse_ttir_metadata(ttir: str, metadata: dict):
 def get_common_bishengir_compile_options(metadata):
     bishengir_target = metadata['target'].arch
     bishengir_target_opt = f"--target={bishengir_target}"
-    return [
-        bishengir_target_opt,
-        # BiShengIR defaults EnableLibCallNoInline to true, which tags AIV
-        # library-call declarations with `hacc.noinline`. No released hivmc
-        # understands that attribute yet -- CANN 9.1.0-beta.3's hivmc-a5 dies
-        # with `'llvm.func' op Unsupported attribute type: "hacc.noinline"`, and
-        # every kernel fails to compile. The attribute is a compile-time
-        # optimisation only, so turn it off until hivmc catches up.
-        "--enable-lib-call-no-inline=false",
-    ]
+    return [bishengir_target_opt]
 
 
 @functools.lru_cache()

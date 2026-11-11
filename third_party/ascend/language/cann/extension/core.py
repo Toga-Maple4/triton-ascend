@@ -199,6 +199,56 @@ def copy(src: Union[tl.tensor, bl.buffer], dst: Union[tl.tensor, bl.buffer], _se
     return semantic.copy(src, dst, _semantic)
 
 
+@builtin
+def copy_from_l1_to_ub(src: Union[tl.tensor, bl.buffer], dst: Union[tl.tensor, bl.buffer], sub_blockid: bool = False, _semantic=None) -> None:
+    """
+    Copies data from the L1 Buffer to the Unified Buffer (UB).
+
+    Lowers to ``hivm.hir.l12ub`` (NZ -> ND conversion). This is the L1->UB
+    delivery primitive used to hand-build an L1 double-buffer pipeline (the
+    counterpart of ``copy_from_ub_to_l1``).
+
+    :param src: The source buffer located in L1 memory.
+    :type src: tl.tensor | bl.buffer
+    :param dst: The destination buffer located in the Unified Buffer (UB).
+    :type dst: tl.tensor | bl.buffer
+    :param sub_blockid: Target sub-vector core's private UB. ``False`` (default)
+        copies into veccore0's UB; ``True`` copies into veccore1's UB (via the
+        ``_sub1`` template variant). In MIX mode where vector work is split
+        across both sub-vector cores, issue two copies (one per veccore half).
+    :type sub_blockid: bool
+    """
+    return semantic.copy_from_l1_to_ub(src, dst, _semantic.builder, sub_blockid)
+
+
+@builtin
+def copy_from_gm_to_l1(src: tl.tensor, dst: bl.buffer,
+                       _semantic=None) -> None:
+    """Copy GM data to L1 while converting an ND tile to NZ layout.
+
+    :param src: A 2-D GM pointer tensor ``[flat_rows, 16]``.
+    :param dst: A 4-D NZ L1 buffer ``[1, fractals_per_tile, 16, N0]``.
+    """
+    return semantic.copy_from_gm_to_l1(src, dst, _semantic.builder)
+
+
+@builtin
+def copy_from_gm_to_l1_nd(src: tl.tensor, dst: bl.buffer, _semantic=None) -> None:
+    """
+    Copies data from Global Memory (GM) to the L1 Buffer without layout change.
+
+    Lowers to ``hivm.hir.load`` gm->cbuf (``load_gm_to_cbuf`` /
+    ``copy_gm_to_cbuf_align_v2`` on A5). L1 stays ND; use with 2-D L1 and 2-D
+    UB buffers plus ``copy_from_l1_to_ub`` for an all-ND staging pipeline.
+
+    :param src: A 2-D GM pointer tensor (e.g. ``in_ptr + idx``).
+    :type src: tl.tensor
+    :param dst: A 2-D ND L1 buffer with the same shape as ``src``.
+    :type dst: bl.buffer
+    """
+    return semantic.copy_from_gm_to_l1_nd(src, dst, _semantic.builder)
+
+
 def create_sync_block(sender, receiver, event_id, is_set: bool, sender_pipe=None, receiver_pipe=None, _semantic=None):
     sender = _unwrap_if_constexpr(sender)
     receiver = _unwrap_if_constexpr(receiver)

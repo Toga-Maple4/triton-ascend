@@ -1133,6 +1133,25 @@ static void release_npu_tensor_handle(void* handle) {{
         raise RuntimeError("unmatched RowCoalescing must retain default coalesce metadata")
     has_dynamic_program_grid_abi = program_grid_transforms is not None
 
+    program_split_accepted = (
+        getattr(metadata, "l1_program_split_kind", "ordinary") == "split_mix_half_grid"
+    )
+    from triton.backends.ascend.l1_launch_contract import (
+        validate_launch_metadata, emit_launch_guards,
+        physical_block_count as split_block_count,
+    )
+    validate_launch_metadata(metadata, coalesce_factor)
+    physical_block_count = "gridX * gridY * gridZ"
+    if program_split_accepted:
+        if program_grid_transforms is not None:
+            raise RuntimeError("New-L1 launch contract cannot be combined with program-grid transforms: the original-grid ABI and physical mapping differ")
+        launcher_cap_enabled = False
+        num_physical_blocks = npu_utils.get_aicore_num()
+        physical_block_count = split_block_count(metadata.l1_program_split_runtime_contract)
+    l1_dev_predicate, l1_dev_python_guard, l1_dev_c_api_guard = emit_launch_guards(
+        metadata, constants, signature, num_physical_blocks)
+
+
     cpp_device_pointer = _CPP_DEVICE_POINTER
     cpp_msprof_extern = _CPP_MSPROF_EXTERN
     cpp_msprof_callback = _CPP_MSPROF_CALLBACK
@@ -1258,7 +1277,7 @@ static void release_npu_tensor_handle(void* handle) {{
   void* workspace_addr_ptr = nullptr;
   void* workspace_handle = nullptr;
   {coalesce_grid_div}
-  uint32_t blockNum4Workspace = gridX * gridY * gridZ;
+  uint32_t blockNum4Workspace = {physical_block_count};
   {get_backend_func("pre_launch", True)}
   {f'''
   uint64_t totalWorkSpaceSize = (uint64_t){workspace_size} * blockNum4Workspace;
@@ -1277,7 +1296,7 @@ static void release_npu_tensor_handle(void* handle) {{
   void* workspace_addr_ptr = nullptr;
   void* workspace_handle = nullptr;
 {_program_grid_launch_preamble}
-  uint32_t blockNum4Workspace = gridX * gridY * gridZ;
+  uint32_t blockNum4Workspace = {physical_block_count};
   {get_backend_func("pre_launch", True)}
   {f'''
   uint64_t totalWorkSpaceSize = (uint64_t){workspace_size} * blockNum4Workspace;
@@ -1291,7 +1310,7 @@ static void release_npu_tensor_handle(void* handle) {{
   void* workspace_addr_ptr = nullptr;
   void* workspace_handle = nullptr;
 {_program_grid_launch_preamble}
-  uint32_t blockNum4Workspace = gridX * gridY * gridZ;
+  uint32_t blockNum4Workspace = {physical_block_count};
   {get_backend_func("pre_launch", True)}
   {f'''
   uint64_t totalWorkSpaceSize = (uint64_t){workspace_size} * blockNum4Workspace;
@@ -1319,7 +1338,7 @@ static void release_npu_tensor_handle(void* handle) {{
 
     _launch_lambda_pre = f"""  {'std::function<cann_error()> launch_call = [=]() -> cann_error' if enable_taskqueue else ''} {{
     {get_backend_func("pre_launch", False)}
-    uint32_t blockNum = gridX * gridY * gridZ;
+    uint32_t blockNum = {physical_block_count};
 
     #ifdef ENABLE_GRID_WARN_PRINT
       static bool warned = false;
@@ -1383,6 +1402,7 @@ static void release_npu_tensor_handle(void* handle) {{
 
 {cpp_device_pointer}
 
+{l1_dev_predicate}
 {_CPP_ALIGN_LAUNCH_OFFSET}
 
 extern "C" {{
@@ -1414,6 +1434,7 @@ void triton_launch_kernel(const char* kernelName, cann_func_handle func, cann_st
   if (num_args > 0 && (kernel_args == nullptr || arg_sizes == nullptr)) {{
     return;
   }}
+  {l1_dev_c_api_guard}
   std::vector<size_t> launch_arg_sizes;
   launch_arg_sizes.reserve(num_args);
   std::vector<std::vector<char>> copied_kernel_args;
@@ -1540,6 +1561,7 @@ static PyObject* launch(PyObject* self, PyObject* const* args, Py_ssize_t nargs)
   if (PyErr_Occurred()) {{
     return nullptr;
   }}
+  {l1_dev_python_guard}
   if (__MsprofFlagL1) {{
     {
       LINE_CHANGE_CHAR.join(

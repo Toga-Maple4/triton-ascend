@@ -24,6 +24,7 @@ __all__ = [
     "buffer_type",
     "subview",
     "alloc",
+    "dealloc",
     "buffer",
     "to_buffer",
     "to_tensor",
@@ -227,6 +228,12 @@ def to_tensor(memref: buffer, writable: bool = True, target_shape=None, _semanti
     :type writable: bool
     """
     return semantic.to_tensor(memref, writable, _semantic.builder, target_shape=target_shape)
+
+
+@builtin
+def dealloc(memref: buffer, _semantic=None) -> None:
+    """Release a local buffer for PlanMemory (no-op after planning)."""
+    return semantic.dealloc(memref, _semantic.builder)
 
 
 def check_subview(src, offsets, sizes, strides):

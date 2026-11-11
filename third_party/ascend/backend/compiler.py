@@ -85,6 +85,39 @@ from triton.backends.compiler import (
 from triton.runtime.cache import get_dump_manager
 
 
+_L1_PROGRAM_SPLIT_SUPPORTED_ARCH_PREFIXES = ("Ascend910_95", "Ascend950")
+
+
+def _supports_l1_program_split(arch: str) -> bool:
+    return any(
+        arch.startswith(prefix)
+        for prefix in _L1_PROGRAM_SPLIT_SUPPORTED_ARCH_PREFIXES
+    )
+
+
+
+def _read_program_split_result(path: Path, metadata: dict) -> None:
+    """Accept only the result belonging to the binary just produced."""
+    try:
+        result = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"missing or invalid program-split result: {path}") from exc
+    from copy import deepcopy
+    from triton.backends.ascend.l1_launch_contract import SCHEMA_VERSION, validate_compile_result
+    validate_compile_result(result, metadata)
+    # Install only validated facts; a failure must leave metadata untouched.
+    for key in list(metadata):
+        if key.startswith("l1_program_split_"):
+            del metadata[key]
+    metadata["l1_program_split_schema"] = SCHEMA_VERSION
+    metadata["l1_program_split_kind"] = result["kind"]
+    if result["kind"] == "ordinary":
+        metadata["l1_program_split_reason"] = result["reason"]
+    else:
+        metadata["l1_program_split_runtime_contract"] = deepcopy(
+            {k: result[k] for k in ("launch", "guard")})
+
+
 # TODO: materialize the concrete min shape
 def min_dot_size(target: GPUTarget):
     return lambda lhsType, rhsType: (1, 1, 1)
@@ -420,6 +453,9 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
         if _load_val is not None:
             ascend.passes.ttir.set_buffer_count(mod, "LOAD", _load_val)
 
+        if opt.enable_l1_program_split and _supports_l1_program_split(opt.target_arch):
+            ascend.passes.ttir.add_l1_pointer_args_noalias(pm, 0)
+
         if opt.debug:
             # Print the equivalent triton-opt command line so the pass
             # pipeline can be reproduced and debugged outside of Python.
@@ -642,7 +678,16 @@ def _parse_ttir_metadata(ttir: str, metadata: dict):
 def get_common_bishengir_compile_options(metadata):
     bishengir_target = metadata['target'].arch
     bishengir_target_opt = f"--target={bishengir_target}"
-    return [bishengir_target_opt]
+    return [
+        bishengir_target_opt,
+        # BiShengIR defaults EnableLibCallNoInline to true, which tags AIV
+        # library-call declarations with `hacc.noinline`. No released hivmc
+        # understands that attribute yet -- CANN 9.1.0-beta.3's hivmc-a5 dies
+        # with `'llvm.func' op Unsupported attribute type: "hacc.noinline"`, and
+        # every kernel fails to compile. The attribute is a compile-time
+        # optimisation only, so turn it off until hivmc catches up.
+        "--enable-lib-call-no-inline=false",
+    ]
 
 
 @functools.lru_cache()
@@ -672,6 +717,62 @@ def get_auto_bind_sub_block_option(metadata):
     enable_auto_bind_sub_block = metadata["enable_auto_bind_sub_block"]
     return (metadata["auto_tile_and_bind_subblock"]
             if enable_auto_bind_sub_block is None else enable_auto_bind_sub_block)
+
+
+def _get_mlir_dump_dir():
+    # Local debugging scaffolding: OPT-IN. Set TRITON_MLIR_DUMP_DIR to a path to
+    # dump the IR at the L1 pass boundary (docker-sim maps it to a host path so
+    # the dumps survive container exit). Unset means no dumping -- writing files
+    # into the caller's working directory is not something a compiler should do
+    # by default.
+    dump_dir = os.getenv("TRITON_MLIR_DUMP_DIR")
+    if not dump_dir:
+        return None
+    try:
+        os.makedirs(dump_dir, exist_ok=True)
+    except OSError:
+        return None
+    return dump_dir
+
+
+def _want_bishengir_print_after_all():
+    # Local debugging scaffolding: OPT-IN. Printing every downstream IR stage is
+    # enormous and belongs to a debugging session, not to a normal compile.
+    return os.getenv("TRITON_MLIR_PRINT_AFTER_ALL", "0") == "1"
+
+
+def _write_mlir_side_dump(path, content):
+    Path(path).write_text(content, encoding="utf-8")
+    print(f"[L1-IR-DUMP] {path}")
+
+
+def _save_bishengir_side_dumps(linalg, metadata_hash, cmd_list, stdout_bytes, stderr_bytes):
+    dump_dir = _get_mlir_dump_dir()
+    if not dump_dir:
+        return
+    _write_mlir_side_dump(
+        os.path.join(dump_dir, f"input_{metadata_hash}.ttadapter.mlir"), linalg)
+    _write_mlir_side_dump(
+        os.path.join(dump_dir, f"cmd_{metadata_hash}.txt"), " ".join(cmd_list))
+    if _want_bishengir_print_after_all():
+        stdout = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
+        stderr = stderr_bytes.decode("utf-8", errors="replace") if stderr_bytes else ""
+        _write_mlir_side_dump(
+            os.path.join(dump_dir, f"passes_{metadata_hash}.mlir"), stdout + stderr)
+
+
+def _resolve_enable_auto_multi_buffer(metadata: dict):
+    """Map launch metadata + TRITON_FORCE_MULTIBUFFER env to bishengir flag."""
+    multibuffer = metadata.get("multibuffer")
+    num_stages = metadata.get("num_stages")
+    force = os.environ.get("TRITON_FORCE_MULTIBUFFER")
+    if force is not None:
+        return force not in ("0", "false", "False")
+    if multibuffer is not None:
+        return bool(multibuffer)
+    if num_stages is not None:
+        return num_stages > 1
+    return None
 
 
 def _save_npuir_debug_output(stdout_bytes: bytes, stderr_bytes: bytes, tmpdir: str, metadata_hash: str):
@@ -749,6 +850,9 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
 
         multibuffer = metadata.get("multibuffer")
         num_stages = metadata.get("num_stages")
+        if os.environ.get("TRITON_FORCE_MULTIBUFFER") is not None:
+            multibuffer = _resolve_enable_auto_multi_buffer(metadata)
+            num_stages = None
 
         if multibuffer is not None or num_stages is not None:
             multi_buffer_value = True
@@ -759,6 +863,8 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += [
                 f"--enable-auto-multi-buffer={multi_buffer_value}",
             ]
+        if opt.enable_l1_program_split:
+            _compile_option_list += ["--enable-program-split-mix=true"]
 
         vf_fusion_mode = metadata["vf_fusion_mode"]
         if vf_fusion_mode is not None:
@@ -922,6 +1028,8 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             src_file, _ = _get_dump_paths(metadata["hash"], ttadapter_path, bin_file)
             _compile_option_list += [f"--save-temps={os.path.dirname(src_file)}"]
 
+        if _want_bishengir_print_after_all():
+            _compile_option_list += ["--mlir-print-ir-after-all"]
         cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
 
         if opt.debug or os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
@@ -932,9 +1040,14 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         try:
             ret = subprocess.run(cmd_list, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         except subprocess.CalledProcessError as e:
+            _save_bishengir_side_dumps(
+                linalg, metadata["hash"], cmd_list, e.stdout, e.stderr)
             if opt.debug:
                 _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
             raise
+
+        _save_bishengir_side_dumps(
+            linalg, metadata["hash"], cmd_list, ret.stdout, ret.stderr)
 
         if opt.debug:
             _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
@@ -944,6 +1057,9 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if match:
             # get the ub bits of triton kernel from bisheng for inductor autotune using
             metadata["required_ub_bits"] = int(match.group(1))
+
+        if opt.enable_l1_program_split:
+            _read_program_split_result(Path(bin_file + ".program_split.json"), metadata)
 
         if not Path(bin_path).exists():
             error_msg = ret.stderr.decode('utf-8') if ret.stderr else ''
@@ -994,6 +1110,9 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
 
         multibuffer = metadata.get("multibuffer")
         num_stages = metadata.get("num_stages")
+        if os.environ.get("TRITON_FORCE_MULTIBUFFER") is not None:
+            multibuffer = _resolve_enable_auto_multi_buffer(metadata)
+            num_stages = None
 
         if multibuffer is not None or num_stages is not None:
             multi_buffer_value = True
@@ -1135,6 +1254,8 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             src_file, _ = _get_dump_paths(metadata["hash"], ttadapter_path, bin_file)
             _compile_option_list += [f"--save-temps={os.path.dirname(src_file)}"]
 
+        if _want_bishengir_print_after_all():
+            _compile_option_list += ["--mlir-print-ir-after-all"]
         cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
 
         if opt.debug or os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
@@ -1145,9 +1266,14 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         try:
             ret = subprocess.run(cmd_list, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         except subprocess.CalledProcessError as e:
+            _save_bishengir_side_dumps(
+                linalg, metadata["hash"], cmd_list, e.stdout, e.stderr)
             if opt.debug:
                 _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
             raise
+
+        _save_bishengir_side_dumps(
+            linalg, metadata["hash"], cmd_list, ret.stdout, ret.stderr)
 
         if opt.debug:
             _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
@@ -1370,7 +1496,16 @@ class NPUOptions:
     stream: Optional[int] = field(default=None, init=False)
     use_bytecode: bool = field(default=True, init=False)
 
+    # New-L1 options; keep retired requests explicit rather than ignored.
+    enable_l1_prefetch: bool = None
+    enable_l1_program_split: bool = False
+    l1_pointer_args_noalias: bool = None
+
     def __post_init__(self, arch, rule_mask):
+        if self.enable_l1_prefetch is not None or os.getenv("TRITON_L1_CACHE_PASS") == "1":
+            raise ValueError("enable_l1_prefetch was removed; use enable_l1_program_split for New-L1")
+        if self.enable_l1_program_split:
+            object.__setattr__(self, "l1_pointer_args_noalias", True)
         from triton.backends.ascend import _apply_ascend_patch
 
         _apply_ascend_patch()

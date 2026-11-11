@@ -39,6 +39,9 @@ __all__ = [
     # to_tensor
     "to_tensor",
     "subview",
+
+    # dealloc
+    "dealloc",
 ]
 
-from .core import builtin, is_builtin, address_space, buffer, alloc, to_buffer, to_tensor, subview
+from .core import builtin, is_builtin, address_space, buffer, alloc, dealloc, to_buffer, to_tensor, subview

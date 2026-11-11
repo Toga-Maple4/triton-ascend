@@ -1853,6 +1853,25 @@ void TritonToLinalgPass::runOnOperation() {
     }
     return WalkResult::advance();
   });
+  // Hand-written cube/vector scopes emit mix-only HIVM ops.
+  if (!existDot) {
+    moduleOp.walk([&](hivm::L12UBOp) {
+      existDot = true;
+      return WalkResult::interrupt();
+    });
+  }
+  if (!existDot) {
+    moduleOp.walk([&](scope::ScopeOp scopeOp) {
+      if (auto attr =
+              scopeOp->getAttrOfType<hivm::TCoreTypeAttr>("hivm.tcore_type")) {
+        if (attr.getTcoretype() == hivm::TCoreType::CUBE) {
+          existDot = true;
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::skip();
+    });
+  }
   existDotFlag = existDot;
 
   // NOTE: existSIMTOp is intentionally computed AFTER

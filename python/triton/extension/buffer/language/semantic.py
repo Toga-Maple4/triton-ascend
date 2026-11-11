@@ -95,6 +95,12 @@ def to_tensor(memref: bl.buffer, writable: bool, builder: ir.builder, target_sha
     return tl.tensor(builder.to_tensor(memref_value, writable), tensor_type)
 
 
+def dealloc(memref: bl.buffer, builder: ir.builder) -> None:
+    if not isinstance(memref, bl.buffer):
+        raise TypeError("memref must be bl.buffer")
+    builder.dealloc(memref.handle)
+
+
 def subview(src: bl.buffer, offsets: List[tl.tensor], sizes: List[tl.constexpr], strides: List[tl.constexpr],
             builder: ir.builder) -> bl.buffer:
 

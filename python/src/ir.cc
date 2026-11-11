@@ -732,6 +732,10 @@ void init_triton_ir(py::module &&m) {
              return py::int_(ret.getInt());
            })
       .def("get_tensordesc_metadata", getTensorDescMetadata)
+      .def("remove_attr",
+           [](ModuleOp &self, const std::string &name) -> void {
+             self->removeAttr(name);
+           })
       .def("create_location_snapshot",
            [](ModuleOp &self, const std::string &fileName) -> void {
              auto printingFlags = getOpPrintingFlags();

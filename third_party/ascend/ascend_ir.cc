@@ -46,8 +46,8 @@
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/Types.h"
-#include "mlir/Support/LLVM.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "llvm/IR/Instructions.h"
 #include <Python.h>
 #include <utility>
@@ -1551,6 +1551,49 @@ void init_ascend_ir(py::module &&m) {
       .def("create_copy_buffer",
            [](AscendNPUIROpBuilder &self, Value src, Value dst) {
              self.create<hivm::CopyOp>(mlir::TypeRange{}, src, dst);
+           })
+      .def("create_l12ub",
+           [](AscendNPUIROpBuilder &self, Value src, Value dst,
+              bool sub_blockid) {
+             // L1(cbuf, NZ) -> UB(ND) data movement with NZ2ND conversion.
+             // sub_blockid selects which sub-vector core's private UB the AIC
+             // copies into (false=veccore0, true=veccore1). It picks the
+             // _sub1 library variant in getOpLibraryCallName.
+             auto *ctx = self.getBuilder().getContext();
+             // The pinned frontend IR has no typed sub_blockid property.
+             // Preserve it as an attribute for the standalone backend.
+             auto copy = self.create<hivm::L12UBOp>(mlir::TypeRange{}, src, dst);
+             copy->setAttr("sub_blockid", mlir::BoolAttr::get(ctx, sub_blockid));
+           })
+      .def("create_nd2nz",
+           [](AscendNPUIROpBuilder &self, Value src, Value dst) {
+             // GM(ND) -> L1(cbuf, NZ) data movement with ND2NZ conversion.
+             // src: 2-D GM memref [flatRows, 16]; dst: 4-D NZ L1 [1, F, 16, N0].
+             auto *ctx = self.getBuilder().getContext();
+             self.create<hivm::ND2NZOp>(mlir::TypeRange{}, src, dst,
+                                        self.getBuilder().getUnitAttr());
+             // Tag the L1 destination with its zN fractal layout so the
+             // downstream l12ub picks the real NZ->ND hardware intrinsic.
+             auto dstTy = mlir::cast<mlir::MemRefType>(dst.getType());
+             unsigned bitWidth = dstTy.getElementType().getIntOrFloatBitWidth();
+             int64_t n0 = 256 / bitWidth; // 32B block / elem bytes: f32->8, f16->16
+             auto layout = hivm::DataLayoutAttr::get(
+                 ctx, hivm::DataLayout::zN, nullptr,
+                 mlir::DenseI64ArrayAttr::get(ctx, {16, n0}));
+             auto mark = self.create<annotation::MarkOp>(dst);
+             mark->setAttr("hivm_data_layout", layout);
+           })
+      .def("create_load_gm_to_l1",
+           [](AscendNPUIROpBuilder &self, Value src, Value dst) {
+             // GM(ND) -> L1(cbuf, ND) without layout change.
+             // Pass src through like create_nd2nz; Triton lowering already
+             // materializes GM block pointers before HIVM ops.
+             auto *ctx = self.getBuilder().getContext();
+             self.create<hivm::LoadOp>(mlir::TypeRange{}, src, dst);
+             auto ndLayout = hivm::DataLayoutAttr::get(
+                 ctx, hivm::DataLayout::ND, nullptr, nullptr);
+             auto mark = self.create<annotation::MarkOp>(dst);
+             mark->setAttr("hivm_data_layout", ndLayout);
            })
       .def("create_copy_tensor",
            [](AscendNPUIROpBuilder &self, Value src, Value dst) {

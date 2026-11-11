@@ -66,6 +66,7 @@ def setup_unified_builder_with_buffer_builder(main_builder, buffer_builder):
         'get_null_attr',
         'get_str_array_attr',
         'alloc',
+        'dealloc',
         'to_buffer',
         'to_tensor',
         'subview',

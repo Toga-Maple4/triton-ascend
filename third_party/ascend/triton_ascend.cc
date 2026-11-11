@@ -1,3 +1,4 @@
+#include "ascend/include/L1SoftwarePrefetchPasses/Passes.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -202,6 +203,14 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
       py::arg("store_coalescing_ub_budget_bytes") = 0,
       py::arg("compile_mode") = "simd_simt_template",
       py::arg("ub_safety_percent") = 80, py::arg("reserved_ub_bytes") = 0);
+
+  // Materialize the caller promise only; semantic recognition stays in IR-Dev.
+  m.def("add_l1_pointer_args_noalias", [](mlir::PassManager &pm,
+                                         unsigned onlyArgumentCount) {
+    AttachPointerArgsNoAliasOptions options;
+    options.onlyArgumentCount = onlyArgumentCount;
+    pm.addPass(mlir::triton::createAttachPointerArgsNoAliasPass(options));
+  });
 
   m.def("set_buffer_count", [](mlir::ModuleOp &module, const std::string &type,
                                int count) {

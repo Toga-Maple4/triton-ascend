@@ -117,6 +117,61 @@ def copy_from_ub_to_l1(src: Union[tl.tensor, bl.buffer], dst: Union[tl.tensor, b
         raise TypeError("src and dst must be tl.tensor or bl.buffer")
 
 
+def copy_from_l1_to_ub(src: Union[tl.tensor, bl.buffer], dst: Union[tl.tensor, bl.buffer], builder, sub_blockid: bool = False):
+    if not builder.is_910_95():
+        raise RuntimeError("this feature is only supported on Ascend910_95")
+    if isinstance(src, tl.tensor) or isinstance(dst, tl.tensor):
+        raise TypeError("tensor not support yet")
+    # NZ(4D L1) -> ND(2D UB) changes rank/shape by design, so shapes differ.
+    if src.dtype != dst.dtype:
+        raise TypeError("src and dst need to have the same type")
+    if isinstance(src, bl.buffer) and isinstance(dst, bl.buffer):
+        if src.space != al.ascend_address_space.L1:
+            raise TypeError("src's AddressSpace must be L1")
+        if dst.space != al.ascend_address_space.UB:
+            raise TypeError("dst's AddressSpace must be UB")
+        # sub_blockid selects which sub-vector core's private UB the AIC copies
+        # into (False=veccore0, True=veccore1). Issue two calls (one per half)
+        # to feed both veccores when vector work is auto-split in MIX mode.
+        builder.create_l12ub(src.handle, dst.handle, sub_blockid)
+    else:
+        raise TypeError("src and dst must be tl.tensor or bl.buffer")
+
+
+def copy_from_gm_to_l1(src: tl.tensor, dst: bl.buffer, builder):
+    """GM(ND) -> L1(cbuf, NZ) via ``hivm.hir.nd2nz``."""
+    if not builder.is_910_95():
+        raise RuntimeError("this feature is only supported on Ascend910_95")
+    if not isinstance(src, tl.tensor):
+        raise TypeError("src must be a GM pointer tensor (tl.tensor)")
+    if not isinstance(dst, bl.buffer):
+        raise TypeError("dst must be an L1 bl.buffer")
+    if dst.space != al.ascend_address_space.L1:
+        raise TypeError("dst's AddressSpace must be L1")
+    builder.create_nd2nz(src.handle, dst.handle)
+
+
+def copy_from_gm_to_l1_nd(src: tl.tensor, dst: bl.buffer, builder):
+    """GM(ND) -> L1(cbuf, ND) without ND2NZ.
+
+    ``src`` must be a ranked tile from ``tl.load`` (not a raw block pointer).
+    Staging uses the ``bind_buffer`` annotation so bishengir lowers to
+    ``hivm.hir.load`` gm->cbuf on 2-D L1 (not ``nd2nz``). Pair with
+    ``copy_from_l1_to_ub`` on matching 2-D UB buffers.
+    """
+    if not builder.is_910_95():
+        raise RuntimeError("this feature is only supported on Ascend910_95")
+    if not isinstance(src, tl.tensor):
+        raise TypeError("src must be a loaded GM tile (tl.tensor from tl.load)")
+    if not isinstance(dst, bl.buffer):
+        raise TypeError("dst must be an L1 bl.buffer")
+    if dst.space != al.ascend_address_space.L1:
+        raise TypeError("dst's AddressSpace must be L1")
+    if len(dst.shape) != 2:
+        raise TypeError("dst must be a 2-D ND L1 buffer for copy_from_gm_to_l1_nd")
+    builder.create_bind_buffer(src.handle, dst.handle)
+
+
 def copy(src: Union[tl.tensor, bl.buffer], dst: Union[tl.tensor, bl.buffer], _semantic=None):
     if not _semantic.builder.is_910_95():
         raise RuntimeError("this feature is only supported on Ascend910_95")

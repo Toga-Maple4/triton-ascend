@@ -65,6 +65,10 @@ void init_buffer_ir(py::module &&m) {
              return self.create<memref::AllocOp>(
                  mlir::cast<MemRefType>(memrefType));
            })
+      .def("dealloc",
+           [](BufferOpBuilder &self, Value memref) -> void {
+             self.create<memref::DeallocOp>(memref);
+           })
       .def("to_buffer",
            [](BufferOpBuilder &self, Value &src,
               const Attribute &addressSpace) -> Value {

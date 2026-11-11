@@ -1,6 +1,7 @@
 import importlib.util
 import sys
 from itertools import product
+import pytest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,6 +10,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "python"))
 
+
+pytestmark = pytest.mark.backend("host")
 
 def _load_driver_module():
     driver_path = Path(__file__).resolve().parents[2] / "backend" / "driver.py"
@@ -588,3 +591,70 @@ def test_npu_launcher_exposes_launcher_so_path(
         metadata,
     )
     mock_launcher_stub.assert_called_with("// header src", "// wrapper src", False)
+
+@patch.object(driver, "NPUUtils")
+@patch.object(driver, "_is_auto_map_parallel_blocks_enabled", return_value=False)
+@patch.object(driver, "force_disable_ffts", return_value=False)
+@patch.object(driver, "is_ffts_supported", return_value=True)
+@patch.object(driver, "get_ascend_arch_from_env", return_value="Ascend950PR_9579")
+@patch.object(driver, "get_backend_func", side_effect=_mock_backend_func)
+def test_program_split_preserves_logical_grid_and_launches_half_as_many_mix_blocks(
+    _mock_backend_func_patch,
+    _mock_arch,
+    _mock_ffts,
+    _mock_disable_ffts,
+    _mock_auto_map,
+    mock_npu_utils,
+):
+    mock_npu_utils.return_value.get_aivector_core_num.return_value = 56
+    mock_npu_utils.return_value.get_aicore_num.return_value = 28
+    metadata = _make_metadata()
+    metadata.l1_program_split_schema = 1
+    metadata.l1_program_split_kind = "split_mix_half_grid"
+    metadata.l1_program_split_logical_programs = 4
+    metadata.l1_program_split_physical_programs = 2
+
+    src = driver.generate_npu_wrapper_src({}, {0: "*fp32"}, metadata)
+
+    assert src.count("uint32_t blockNum4Workspace = 2;") == 2
+    assert src.count("uint32_t blockNum = 2;") == 2
+    assert "memcpy(launch_args.data() + grid_offset, &gridX" in src
+    assert "static_cast<int32_t>(gridX)" in src
+
+
+@pytest.mark.parametrize("auto_map", [False, True])
+@pytest.mark.parametrize("static_columns", [False, True])
+def test_runtime_program_split_launch_configuration(auto_map, static_columns):
+    metadata = _make_metadata()
+    metadata.compile_on_910_95 = True
+    metadata.parallel_mode = "simd"
+    metadata.workspace_size = 128
+    metadata.l1_program_split_schema = 1
+    metadata.l1_program_split_kind = "split_mix_half_grid"
+    contract = dict(rows_arg=4, tile_rows=32, tile_cols=2048, row_stride=8192, element_bits=16)
+    contract["static_cols" if static_columns else "cols_arg"] = 8192 if static_columns else 5
+    metadata.l1_program_split_runtime_contract = contract
+    signature = {0: "*fp16", 1: "*fp16", 2: "i32"}
+    if not static_columns:
+        signature[3] = "i32"
+    with patch.object(driver, "NPUUtils") as npu, \
+         patch.object(driver, "_is_auto_map_parallel_blocks_enabled", return_value=auto_map), \
+         patch.object(driver, "is_ffts_supported", return_value=False), \
+         patch.object(driver, "force_disable_ffts", return_value=False), \
+         patch.object(driver, "get_ascend_arch_from_env", return_value="Ascend950PR_9589"), \
+         patch.object(driver, "get_backend_func", side_effect=_mock_backend_func):
+        npu.return_value.get_aivector_core_num.return_value = 64
+        npu.return_value.get_aicore_num.return_value = 32
+        source = driver.generate_npu_wrapper_src({}, signature, metadata)
+        metadata.l1_program_split_kind = "ordinary"
+        metadata.l1_program_split_runtime_contract = None
+        ordinary = driver.generate_npu_wrapper_src({}, signature, metadata)
+    assert source.count("uint32_t blockNum = gridX / 2;") == 2
+    assert source.count("uint32_t blockNum4Workspace = gridX / 2;") == 2
+    assert "128 * blockNum4Workspace" in source
+    assert "memcpy(launch_args.data() + grid_offset, &gridX" in source
+    assert "static_cast<int32_t>(gridX)" in source
+    assert "gridX = gridX / 2" not in source
+    assert "blockNum = std::min" not in source
+    assert ("blockNum = std::min" in ordinary) == auto_map
+    assert "valid_runtime_program_split" not in ordinary

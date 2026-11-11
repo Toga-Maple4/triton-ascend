@@ -33,6 +33,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
 #include "triton/Conversion/TritonToTritonGPU/Passes.h"
 #include "triton/Target/LLVMIR/Passes.h"
+#include "ascend/include/L1SoftwarePrefetchPasses/Passes.h"
 
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
@@ -63,6 +64,7 @@ void registerTestScopeIdAllocationPass();
 
 inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::registerAllPasses();
+  mlir::triton::registerL1SoftwarePrefetchPasses();
   mlir::triton::registerTritonPasses();
   mlir::triton::gpu::registerTritonGPUPasses();
   mlir::triton::nvidia_gpu::registerTritonNvidiaGPUPasses();

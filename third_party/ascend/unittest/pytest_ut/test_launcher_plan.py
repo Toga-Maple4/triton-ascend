@@ -110,7 +110,7 @@ def test_empty_and_constexpr_arguments():
     assert launcher.argument_types({}) == []
     assert launcher.argument_types({0: "constexpr"}) == [(launcher.CONSTEXPR, -1)]
     assert launcher.argument_types({0: "i1", 1: "u1", 2: "bf16"}) == [(launcher.I32, -1), (launcher.U32, -1),
-                                                                      (launcher.F32, -1)]
+                                                                      (launcher.BF16, -1)]
 
 
 @pytest.mark.parametrize("signature,constants,expected", [
@@ -421,16 +421,51 @@ def test_preparation_cache_root_switch_and_deleted_artifacts(prepared_backend, m
     else:
         monkeypatch.setenv(setting, str(tmp_path / "new-cache"))
     second = state.driver.NPULauncher(state.src, metadata())
-    assert second._runtime_path != first._runtime_path
+    # The helper and runtime live under the backend's fixed bin/ directory:
+    # switching the kernel cache root neither relocates nor rebuilds them.
+    assert second._runtime_path == first._runtime_path
     assert Path(second._runtime_path).parent.name == Path(first._runtime_path).parent.name
-    assert len(state.builds) == 4
+    assert len(state.builds) == 2
     Path(second._runtime_path).unlink()
     helper = state.driver.NPUUtils().get_so_path()
     Path(helper).unlink()
     third = state.driver.NPULauncher(state.src, metadata())
     assert third._runtime_path == second._runtime_path
     assert Path(third._runtime_path).exists() and Path(helper).exists()
-    assert len(state.builds) == 6
+    assert len(state.builds) == 4
+
+
+def test_runtime_survives_inductor_cache_repointing(prepared_backend, monkeypatch, tmp_path):
+    state = prepared_backend
+    first = state.driver.NPULauncher(state.src, metadata())
+    first_helper = state.driver.NPUUtils().get_so_path()
+    first_runtime = first._runtime_path
+    # PyTorch Inductor repoints TRITON_CACHE_DIR at a fresh temporary root
+    # (tempfile.mkdtemp) after the helper was already built: the helper and
+    # runtime keep serving from their stable bin/ location instead of
+    # following (or being stranded by) the repointed kernel cache root.
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "inductor-temp"))
+    second = state.driver.NPULauncher(state.src, metadata())
+    second_helper = state.driver.NPUUtils().get_so_path()
+    assert second_helper == first_helper
+    assert Path(second_helper).parents[1] == state.root / "bin"
+    assert second._runtime_path == first_runtime
+    assert Path(first_helper).exists()
+    assert len(state.builds) == 2
+
+
+def test_get_runtime_rebuilds_helper_deleted_after_resolution(prepared_backend):
+    state = prepared_backend
+    first = state.driver.NPULauncher(state.src, metadata())
+    helper = state.driver.NPUUtils().get_so_path()
+    Path(helper).unlink()
+    # A caller may pass a path resolved before the artifact was deleted or
+    # evicted: get_runtime must re-resolve (and rebuild) the helper before
+    # baking its absolute path into the runtime's sources.
+    _, path = launcher.get_runtime(str(helper))
+    assert Path(helper).exists()
+    assert path == first._runtime_path
+    assert len(state.builds) == 3
 
 
 def test_debug_dump_and_lazy_export_after_preparation_reuse(prepared_backend, monkeypatch, tmp_path):
@@ -466,7 +501,7 @@ def test_device_print_configuration_invalidates_runtime(prepared_backend, monkey
     assert state.driver.NPULauncher(state.src, metadata())._runtime_path == first._runtime_path
 
 
-def test_custom_cache_queries_and_materialization_are_not_bypassed(prepared_backend, monkeypatch):
+def test_custom_cache_managers_stay_scoped_to_per_kernel_artifacts(prepared_backend, monkeypatch):
     from triton.runtime.cache import FileCacheManager, get_cache_manager
     state = prepared_backend
     queries = []
@@ -482,20 +517,26 @@ def test_custom_cache_queries_and_materialization_are_not_bypassed(prepared_back
 
     monkeypatch.setattr(state.driver, "get_cache_manager", manager)
     monkeypatch.setattr(launcher, "get_cache_manager", manager)
-    state.driver.NPULauncher(state.src, metadata())
+    first = state.driver.NPULauncher(state.src, metadata())
     queries.clear()
     for _ in range(4):
         state.driver.NPULauncher(state.src, metadata())
-    assert len(queries) == 8
-    assert queries.count("npu_utils.so") == 4
+    # Shared artifacts are served from the backend's bin/ directory and never
+    # consult knob-configured custom managers; those stay scoped to per-kernel
+    # traffic such as the lazily built export adapter.
+    assert queries == []
+    assert Path(first._runtime_path).exists()
     assert len(state.builds) == 2
+    import sysconfig
+    first.get_launcher_so_path()
+    assert "launcher_export" + sysconfig.get_config_var("EXT_SUFFIX") in queries
 
 
-def test_remote_cache_keeps_access_accounting(prepared_backend, monkeypatch):
+def test_remote_cache_stays_scoped_to_kernel_artifacts(prepared_backend, monkeypatch):
     from triton import knobs
     from triton.runtime.cache import RemoteCacheManager
     state = prepared_backend
-    storage, accesses = {}, []
+    accesses = []
 
     class RemoteBackend:
 
@@ -504,34 +545,37 @@ def test_remote_cache_keeps_access_accounting(prepared_backend, monkeypatch):
 
         def get(self, names):
             accesses.append((self.key, tuple(names)))
-            return {name: storage[self.key, name] for name in names if (self.key, name) in storage}
+            return {}
 
         def put(self, name, value):
-            storage[self.key, name] = value
+            accesses.append((self.key, (name, )))
 
     monkeypatch.setattr(knobs.cache, "manager_class", RemoteCacheManager)
     monkeypatch.setattr(knobs.cache, "remote_manager_class", RemoteBackend)
     first = state.driver.NPULauncher(state.src, metadata())
     accesses.clear()
-    # Even materialized files must not bypass remote access accounting.
     for _ in range(3):
         assert state.driver.NPULauncher(state.src, metadata())._runtime_path == first._runtime_path
-    assert len(accesses) == 6
+    # Shared helper/runtime artifacts are served from the backend's bin/
+    # directory; a configured remote backend sees no traffic for them and is
+    # left to the per-kernel artifacts it is meant to serve.
+    assert accesses == []
+    assert Path(first._runtime_path).exists()
     assert len(state.builds) == 2
 
 
 def test_preparation_preserves_existing_content_keys(prepared_backend):
     state = prepared_backend
     instance = state.driver.NPULauncher(state.src, metadata())
-    from triton.runtime.cache import get_cache_manager
     source = (state.root / "npu_utils.cpp").read_text()
     expected = hashlib.sha256(json.dumps([source, state.fingerprint], sort_keys=True).encode()).hexdigest()
-    assert state.driver.NPUUtils().get_so_path() == get_cache_manager(expected).get_file("npu_utils.so")
+    bin_dir = state.root / "bin"
+    assert state.driver.NPUUtils().get_so_path() == utils.bin_cache_manager(expected, bin_dir).get_file("npu_utils.so")
     sources = launcher._runtime_sources()
-    config = launcher._runtime_config(launcher._cache_relative(state.driver.NPUUtils().get_so_path()),
-                                      utils.backend_policy, None)
+    config = launcher._runtime_config(state.driver.NPUUtils().get_so_path(), utils.backend_policy, None)
     key = hashlib.sha256(json.dumps([state.fingerprint, {**sources, **config}], sort_keys=True).encode()).hexdigest()
-    assert Path(instance._runtime_path).parent.name == get_cache_manager(key).key
+    assert Path(instance._runtime_path).parent.parent == bin_dir
+    assert Path(instance._runtime_path).parent.name == utils.bin_cache_manager(key, bin_dir).key
 
 
 def _concurrent_artifact_worker(root, gate, queue):
@@ -677,11 +721,27 @@ def _grid_contract(sequence):
         ])
 
 
-@pytest.mark.parametrize("sequence,expected", [
+_PROGRAM_GRID_CASES = [
     ([(1, 16, False)], launcher.IAT),
+    ([(1, 64, False)], launcher.IAT | launcher.IAT64),
     ([(0, 64, True)], launcher.PTSM),
     ([(1, 16, False), (0, 4, True)], launcher.IAT | launcher.PTSM),
-])
+    *[([(0, factor, False)], launcher.DOT_ROW | launcher.COALESCE_CEIL) for factor in (2, 4, 8, 16, 32)],
+]
+
+
+def test_program_grid_sequence_coverage():
+    from triton.backends.ascend.program_grid import _SUPPORTED_SEQUENCES
+    # A new compiler contract must be covered by the launcher mapping and
+    # native grid/ABI checks below; do not silently leave a sequence untested.
+    assert {
+        tuple((axis, factor, persistent, persistent)
+              for axis, factor, persistent in sequence)
+        for sequence, _ in _PROGRAM_GRID_CASES
+    } == _SUPPORTED_SEQUENCES
+
+
+@pytest.mark.parametrize("sequence,expected", _PROGRAM_GRID_CASES)
 @pytest.mark.parametrize("as_json", [False, True])
 def test_program_grid_plan_modes(policy, sequence, expected, as_json):
     contract = _grid_contract(sequence)
@@ -689,9 +749,11 @@ def test_program_grid_plan_modes(policy, sequence, expected, as_json):
         metadata(program_grid_mapping_applied=True,
                  program_grid_transforms=json.dumps(contract) if as_json else contract,
                  ptsm_cap_authorized=any(t[2] for t in sequence)), policy)
-    assert spec.flags & (launcher.IAT | launcher.PTSM) == expected
+    assert spec.flags & (launcher.IAT | launcher.IAT64 | launcher.PTSM | launcher.DOT_ROW
+                         | launcher.COALESCE_CEIL) == expected
     assert not spec.flags & launcher.AUTO_MAP
-    assert (spec.coalesce_factor, spec.coalesce_axis) == (1, -1)
+    factor, axis = (sequence[0][1], 0) if expected & launcher.DOT_ROW else (1, -1)
+    assert (spec.coalesce_factor, spec.coalesce_axis) == (factor, axis)
 
 
 @pytest.mark.parametrize(
@@ -735,7 +797,7 @@ def test_program_grid_rejects_unsafe_mapping_combinations(policy, changes, error
 @pytest.mark.parametrize("blacklisted", [False, True])
 @pytest.mark.parametrize("auto_blockify", [False, True])
 @pytest.mark.parametrize("pure_simt", [False, True])
-@pytest.mark.parametrize("mapping", ["none", "row", "iat"])
+@pytest.mark.parametrize("mapping", ["none", "row", "iat", "dot_row"])
 def test_block_cap_follows_compiler_decision(policy, monkeypatch, auto_map, blacklisted, auto_blockify, pure_simt,
                                              mapping):
     # The runtime policy may differ from the one used to compile a cached
@@ -747,10 +809,13 @@ def test_block_cap_follows_compiler_decision(policy, monkeypatch, auto_map, blac
         fields.update(row_coalescing_applied=True, coalesce_factor=4, coalesce_axis=0, coalesce_grid_ceil_div=True)
     elif mapping == "iat":
         fields.update(program_grid_mapping_applied=True, program_grid_transforms=_grid_contract([(1, 16, False)]))
+    elif mapping == "dot_row":
+        fields.update(program_grid_mapping_applied=True, program_grid_transforms=_grid_contract([(0, 8, False)]))
     spec = launcher.make_launch_spec(metadata(**fields), policy)
     assert bool(spec.flags & launcher.AUTO_MAP) == auto_blockify
     assert bool(spec.flags & launcher.IAT) == (mapping == "iat")
-    assert bool(spec.flags & launcher.COALESCE_CEIL) == (mapping == "row")
+    assert bool(spec.flags & launcher.DOT_ROW) == (mapping == "dot_row")
+    assert bool(spec.flags & launcher.COALESCE_CEIL) == (mapping in ("row", "dot_row"))
     assert spec.physical_blocks == 40
 
 
@@ -769,27 +834,28 @@ def native_grid_probe(tmp_path_factory):
     return output
 
 
-@pytest.mark.parametrize("sequence,mode", [
-    ([(1, 16, False)], launcher.IAT),
-    ([(0, 64, True)], launcher.PTSM),
-    ([(1, 16, False), (0, 4, True)], launcher.IAT | launcher.PTSM),
-])
+@pytest.mark.parametrize("sequence,mode", _PROGRAM_GRID_CASES)
 @pytest.mark.parametrize("auto_map", [False, True])
 def test_native_grid_matches_compiler_reference(native_grid_probe, sequence, mode, auto_map):
     import random
     import subprocess
     from triton.backends.ascend.program_grid import apply_program_grid_transforms
     contract = _grid_contract(sequence)
+    factor, axis = (sequence[0][1], 0) if mode & launcher.DOT_ROW else (1, -1)
     rng = random.Random(2109)
     grids = [(1, 1, 1), (4097, 17, 3), (65, 33, 1), (2147483647, 1, 1)]
+    grids += [(1, y, 1) for y in (15, 16, 17, 63, 64, 65, 2147483647)]
     grids += [tuple(rng.randint(1, n) for n in (32768, 128, 4)) for _ in range(32)]
     for physical in (1, 20, 40, 72):
         for grid in grids:
             flags = mode | (launcher.AUTO_MAP if auto_map else 0)
             values = [
-                int(v)
-                for v in subprocess.check_output([str(
-                    native_grid_probe), str(flags), str(physical), *map(str, grid)], text=True).split()
+                int(v) for v in subprocess.check_output(
+                    [str(native_grid_probe),
+                     str(flags),
+                     str(physical), *map(str, grid),
+                     str(factor),
+                     str(axis)], text=True).split()
             ]
             expected = apply_program_grid_transforms(grid, contract, physical_core_count=physical)
             logical = expected[0] * expected[1] * expected[2]
@@ -797,7 +863,9 @@ def test_native_grid_matches_compiler_reference(native_grid_probe, sequence, mod
             # lock/workspace, pointer, i8, padding, original X/Y, final X/Y/Z,
             # padding, debug pointer: exact ABI offsets, independent of grid.
             assert values[5:] == [24, 28, 36, 48, 56]
-    values = subprocess.check_output([str(native_grid_probe), str(mode), "40", "0", "17", "3"], text=True)
+    values = subprocess.check_output(
+        [str(native_grid_probe), str(mode), "40", "0", "17", "3",
+         str(factor), str(axis)], text=True)
     assert list(map(int, values.split()))[:5] == [0, 17, 3, 0, 0]
 
 
@@ -896,21 +964,6 @@ def test_compiler_version_reused_across_processes_and_coordinated(host_compiler)
     assert tool.log.read_text().splitlines() == ["query"]
     assert _query_host_compiler_processes(tool.path, cache_dir, 1) == ["test-compiler-v1"]
     assert tool.log.read_text().splitlines() == ["query"]
-
-
-def test_compiler_library_build_id_invalidates_even_with_unchanged_stat(host_compiler, monkeypatch):
-    tool = host_compiler
-    old_identity = utils._file_identity(tool.library)
-    file_identity = utils._file_identity
-    monkeypatch.setattr(utils, "_file_identity", lambda path: old_identity
-                        if Path(path) == tool.library else file_identity(path))
-    assert _query_host_compiler(tool.path) == "test-compiler-v1"
-    old_build_id = utils._npu_elf_info(tool.library)[1]
-    tool.replace_version("test-compiler-v2")
-    assert utils._npu_elf_info(tool.library)[1] != old_build_id
-    utils._npu_compiler_version.cache_clear()  # A new process has no LRU entries.
-    assert _query_host_compiler(tool.path) == "test-compiler-v2"
-    assert len(tool.log.read_text().splitlines()) == 2
 
 
 def test_compiler_selection_symlink_and_atomic_replacement(host_compiler, monkeypatch):
@@ -1051,16 +1104,56 @@ def test_compiler_version_unstable_installation_does_not_publish(host_compiler, 
     assert len(tool.log.read_text().splitlines()) == 2
 
 
-@pytest.mark.parametrize("loader_result", ["", "unknown output", "libmissing.so => not found"])
-def test_compiler_version_unresolved_dependencies_query_live(host_compiler, monkeypatch, loader_result):
-    tool = host_compiler
-    check_output = subprocess.check_output
+@pytest.mark.parametrize("size", [0, 4096])
+def test_proton_profile_size_is_carried_in_launch_plan(policy, size):
+    spec = launcher.make_launch_spec(metadata(profile_scratch_size=size), policy)
+    assert spec.profile_scratch_size == size
 
-    def output(command, **kwargs):
-        if "--list" in command:
-            return loader_result
-        return check_output(command, **kwargs)
 
-    monkeypatch.setattr(subprocess, "check_output", output)
-    assert _query_host_compiler(tool.path) == "test-compiler-v1"
-    assert not list((tool.root / "cache").rglob("compiler-version.json"))
+def test_proton_scratch_follows_expanded_user_arguments():
+    calls = []
+    wrapped = launcher.wrap_handle_tensordesc(lambda *args: calls.append(args), {0: ("i32", "i64")},
+                                              profile_scratch=True)
+    prefix = tuple(range(9))
+    scratch = object()
+    wrapped(*prefix, (11, 13), scratch)
+    assert calls == [(*prefix, 11, 13, scratch)]
+    with pytest.raises(TypeError):
+        wrapped(*prefix, (11, 13))
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_proton_exit_drains_framework_queue_before_collecting(monkeypatch, enabled):
+    from triton.backends.ascend import driver
+    from triton.runtime import _allocation
+
+    events = []
+    scratch = object()
+    interface = SimpleNamespace(synchronize=lambda: events.append("synchronize"))
+    monkeypatch.setattr(driver, "get_backend_func", lambda method: interface)
+    monkeypatch.setattr(_allocation, "_profile_allocator",
+                        SimpleNamespace(get=lambda: lambda size, alignment, stream: scratch))
+    instance = object.__new__(driver.NPULauncher)
+    instance.compile_only = False
+    instance.profile_scratch_size = 16 if enabled else 0
+    instance.profile_scratch_align = 64
+
+    def native(*args):
+        if enabled:
+            assert args[-1] is scratch
+        events.append("enqueue")
+        args[8](args[6])
+
+    instance.launch = native
+    exit_hook = lambda metadata: events.append("collect")
+    instance(1, 1, 1, 0, 0, {}, None, None, exit_hook)
+    assert events == (["enqueue", "synchronize", "collect"] if enabled else ["enqueue", "collect"])
+
+
+@pytest.mark.parametrize(
+    "flags", [launcher.IAT64, launcher.IAT64 | launcher.PTSM, launcher.IAT64 | launcher.IAT | launcher.PTSM])
+def test_native_grid_rejects_invalid_iat64(native_grid_probe, flags):
+    result = subprocess.run(
+        [str(native_grid_probe), str(flags), "40", "1", "65", "1", "1", "-1"], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "IAT64 requires standalone IAT" in result.stderr

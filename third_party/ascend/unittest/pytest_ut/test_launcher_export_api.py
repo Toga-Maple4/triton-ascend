@@ -35,7 +35,8 @@ class Spec(ct.Structure):
                 ("workspace_size", ct.c_uint64), ("ordered_locks", ct.c_uint64), ("unordered_locks", ct.c_uint64),
                 ("lock_init_value", ct.c_int64), ("participant_factor", ct.c_uint32), ("physical_blocks", ct.c_uint32),
                 ("coalesce_factor", ct.c_uint32), ("coalesce_axis", ct.c_int32), ("task_type", ct.c_uint32),
-                ("mix_ratio", ct.c_uint32), ("shared_mem_dynamic_size", ct.c_uint32)]
+                ("mix_ratio", ct.c_uint32), ("shared_mem_dynamic_size", ct.c_uint32),
+                ("profile_scratch_size", ct.c_uint64)]
 
 
 class ArgType(ct.Structure):
@@ -46,7 +47,7 @@ class Request(ct.Structure):
     _fields_ = [("version", ct.c_uint32), ("struct_size", ct.c_uint32), ("kernel_name", ct.c_char_p),
                 ("function", ct.c_void_p), ("stream", ct.c_void_p), ("grid", ct.c_int32 * 3),
                 ("shapes_data", ct.POINTER(ct.c_int64)), ("shape_dims", ct.POINTER(ct.c_int)),
-                ("tensor_kinds", ct.POINTER(ct.c_int)), ("num_tensors", ct.c_int)]
+                ("tensor_kinds", ct.POINTER(ct.c_int)), ("num_tensors", ct.c_int), ("profile_scratch", ct.c_void_p)]
 
 
 @pytest.fixture(scope="module")
@@ -117,19 +118,22 @@ def test_c_api_empty_signature_and_constexpr(native_api, kinds, flags):
         assert error.value == b""
 
 
-@pytest.mark.parametrize("kind,value_type,value", [
-    (launcher.I8, ct.c_int8, -7),
-    (launcher.U8, ct.c_uint8, 250),
-    (launcher.I16, ct.c_int16, -1234),
-    (launcher.U16, ct.c_uint16, 65530),
-    (launcher.I32, ct.c_int32, -34342),
-    (launcher.U32, ct.c_uint32, 2**31 + 5),
-    (launcher.I64, ct.c_int64, -(2**40) + 7),
-    (launcher.U64, ct.c_uint64, 2**48 + 17),
-    (launcher.F32, ct.c_float, 1.25),
-    (launcher.F64, ct.c_double, -3.75),
-    (launcher.POINTER, ct.c_void_p, 0x123456789ABCDEF0),
-], ids=["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64", "pointer"])
+@pytest.mark.parametrize(
+    "kind,value_type,value", [
+        (launcher.I8, ct.c_int8, -7),
+        (launcher.U8, ct.c_uint8, 250),
+        (launcher.I16, ct.c_int16, -1234),
+        (launcher.U16, ct.c_uint16, 65530),
+        (launcher.I32, ct.c_int32, -34342),
+        (launcher.U32, ct.c_uint32, 2**31 + 5),
+        (launcher.I64, ct.c_int64, -(2**40) + 7),
+        (launcher.U64, ct.c_uint64, 2**48 + 17),
+        (launcher.F32, ct.c_float, 1.25),
+        (launcher.F64, ct.c_double, -3.75),
+        (launcher.F16, ct.c_uint16, 0x5140),
+        (launcher.BF16, ct.c_uint16, 0x4228),
+        (launcher.POINTER, ct.c_void_p, 0x123456789ABCDEF0),
+    ], ids=["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64", "f16", "bf16", "pointer"])
 def test_c_api_checks_argument_count_and_width(native_api, kind, value_type, value):
     with plan(native_api, [kind]) as handle:
         req = request()
@@ -233,6 +237,8 @@ def python_launcher_factory():
     (launcher.U64, 2**64 - 1),
     (launcher.F32, -1.0),
     (launcher.F64, -1.0),
+    (launcher.F16, -1.0),
+    (launcher.BF16, -1.0),
     (launcher.POINTER, 0),
     (launcher.POINTER, 2**64 - 1),
 ])
@@ -255,6 +261,8 @@ def test_python_conversion_accepts_error_sentinel_values(python_launcher_factory
     (launcher.U64, 2**64, OverflowError),
     (launcher.F32, object(), TypeError),
     (launcher.F64, object(), TypeError),
+    (launcher.F16, object(), TypeError),
+    (launcher.BF16, object(), TypeError),
     (launcher.POINTER, -1, OverflowError),
     (launcher.POINTER, 2**64, OverflowError),
 ])
@@ -273,7 +281,7 @@ def test_python_conversion_stops_before_later_arguments(python_launcher_factory,
     assert events == []
 
 
-@pytest.mark.parametrize("kind", [launcher.I64, launcher.F64, launcher.POINTER])
+@pytest.mark.parametrize("kind", [launcher.I64, launcher.F64, launcher.F16, launcher.BF16, launcher.POINTER])
 def test_python_conversion_preserves_custom_exceptions(python_launcher_factory, kind):
 
     class RaisingValue:
@@ -321,3 +329,33 @@ def test_c_api_rejects_conflicting_program_grid_configuration(native_api, flags,
     handle = native_api.triton_npu_create_plan_v1(ct.byref(config), None, 0, error, len(error))
     assert not handle
     assert error.value
+
+
+@pytest.mark.parametrize("factor", [2, 4, 8, 16, 32])
+def test_c_api_accepts_dynamic_dot_row_configuration(native_api, factor):
+    with plan(native_api, [launcher.POINTER], flags=launcher.DOT_ROW | launcher.COALESCE_CEIL, coalesce_factor=factor,
+              coalesce_axis=0):
+        pass
+
+
+@pytest.mark.parametrize("changes", [
+    {"coalesce_factor": 1},
+    {"coalesce_factor": 3},
+    {"coalesce_factor": 64},
+    {"coalesce_axis": -1},
+    {"coalesce_axis": 1},
+    {"coalesce_axis": 2},
+    {"flags": launcher.DOT_ROW},
+    {"flags": launcher.DOT_ROW | launcher.COALESCE_CEIL | launcher.IAT},
+    {"flags": launcher.DOT_ROW | launcher.COALESCE_CEIL | launcher.PTSM},
+])
+def test_c_api_rejects_invalid_dynamic_dot_row_configuration(native_api, changes):
+    config = spec()
+    config.flags = launcher.DOT_ROW | launcher.COALESCE_CEIL
+    config.coalesce_factor, config.coalesce_axis = 8, 0
+    for field, value in changes.items():
+        setattr(config, field, value)
+    error = ct.create_string_buffer(256)
+    handle = native_api.triton_npu_create_plan_v1(ct.byref(config), None, 0, error, len(error))
+    assert not handle
+    assert b"invalid dynamic DotRow configuration" in error.value

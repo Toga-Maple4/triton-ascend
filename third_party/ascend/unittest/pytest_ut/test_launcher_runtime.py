@@ -90,13 +90,27 @@ def _native(compiled):
     return driver.NPULauncher(compiled.src, compiled.metadata)
 
 
-def _run(instance, compiled, args, grid=(1, 1, 1), stream=None):
+def _drain_dispatch_queue():
+    # These helpers reach the launcher directly, bypassing the framework
+    # dispatch queue. Without a barrier a write issued just before the call
+    # (for example a fill_ sentinel) may still be pending on the dispatch
+    # thread, reach the stream after the kernel and overwrite its output,
+    # which makes the assertions below order- and load-dependent. Tests that
+    # measure queued submission keep their launches unordered with
+    # ``barrier=False`` and drain the queue once before they start.
+    torch.npu.synchronize()
+
+
+def _run(instance, compiled, args, grid=(1, 1, 1), stream=None, barrier=True):
+    if barrier:
+        _drain_dispatch_queue()
     if stream is None:
         stream = driver.NPUDriver().get_current_stream()
     instance(*grid, stream, compiled.function, compiled.packed_metadata, None, None, None, *args)
 
 
 def _c_launch(instance, compiled, values, grid=(1, 1, 1)):
+    _drain_dispatch_queue()
     library = ctypes.CDLL(instance.get_launcher_so_path())
     launch = library.triton_launch_kernel
     launch.argtypes = [
@@ -135,6 +149,7 @@ def test_shared_launcher_values_and_export(monkeypatch, taskqueue, dtype, n):
         module = importlib.util.module_from_spec(module_spec)
         module_spec.loader.exec_module(module)
         y.fill_(-3)
+        torch.npu.synchronize()  # Direct submission bypasses the framework queue.
         module.launch(*grid,
                       driver.NPUDriver().get_current_stream(), compiled.function, compiled.packed_metadata, None, None,
                       None, *args)
@@ -198,6 +213,7 @@ def test_value_folded_arguments_preserve_values_and_grid(monkeypatch, tmp_path, 
     assert output.cpu().tolist() == expected
 
     output.fill_(-2)
+    torch.npu.synchronize()  # Direct submission bypasses the framework queue.
     module_spec = importlib.util.spec_from_file_location("__triton_launcher", instance.get_launcher_so_path())
     module = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(module)
@@ -296,8 +312,11 @@ def test_streams_and_queued_plan_ownership(monkeypatch):
             y = torch.empty_like(x)
             compiled = _copy_add.warmup(x, y, 1024, index + 2, BLOCK=128, grid=(8, ))
             instance = _native(compiled)
+            # Inputs must be ready before the first direct submission; the
+            # launches themselves stay queued to exercise plan ownership.
+            torch.npu.synchronize()
             for _ in range(50):
-                _run(instance, compiled, (x, y, 1024, index + 2, 128), grid=(8, 1, 1))
+                _run(instance, compiled, (x, y, 1024, index + 2, 128), grid=(8, 1, 1), barrier=False)
             pairs.append((x, y, index + 2))
             del instance
     gc.collect()
@@ -402,7 +421,7 @@ def test_workspace_is_released_after_execution(monkeypatch, record_property, tas
     torch.npu.synchronize()
     before = torch.npu.memory_allocated()
     for _ in range(64):
-        _run(instance, compiled, args, grid=(4, 3, 1))
+        _run(instance, compiled, args, grid=(4, 3, 1), barrier=False)
         if sync_each:
             torch.npu.synchronize()
     torch.npu.synchronize()
@@ -432,8 +451,9 @@ def test_workspace_streams_and_queued_plan_ownership(monkeypatch, record_propert
     for _ in range(32):
         for instance, (compiled, args, _, stream_id) in zip(instances, cases):
             # Submit from the default stream's context to explicit, distinct
-            # launch streams. Workspace reuse must follow the launch stream.
-            _run(instance, compiled, args, grid=(4, 3, 1), stream=stream_id)
+            # launch streams. Workspace reuse must follow the launch stream,
+            # so these launches stay unordered.
+            _run(instance, compiled, args, grid=(4, 3, 1), stream=stream_id, barrier=False)
         scratch = torch.empty(65536 * 12, dtype=torch.uint8, device="npu")
         scratch.fill_(165)
         del scratch
@@ -489,8 +509,10 @@ def _original_grid_echo(out, original_x, original_y):
 @pytest.mark.parametrize("taskqueue", [False, True])
 @pytest.mark.parametrize("sequence", [
     [(1, 16, False)],
+    [(1, 64, False)],
     [(0, 64, True)],
     [(1, 16, False), (0, 4, True)],
+    *[[(0, factor, False)] for factor in (2, 4, 8, 16, 32)],
 ])
 def test_dynamic_original_grid_abi_reaches_both_entries(monkeypatch, taskqueue, sequence):
     from types import SimpleNamespace
@@ -516,15 +538,82 @@ def test_dynamic_original_grid_abi_reaches_both_entries(monkeypatch, taskqueue, 
     instance = driver.NPULauncher(source, metadata)
     output = torch.full((5, ), -1, dtype=torch.int32, device="npu")
     # Reuse one plan and one exported stub for changing, non-divisible grids.
-    for grid in [(1, 1, 1), (4097, 17, 3), (129, 65, 1)]:
+    # Keep the largest transformed launch below legacy CANN's 65535-block
+    # limit: ceil(2049 / 2) * 17 * 3 == 52275 for DotRow factor=2.
+    for grid in [(1, 1, 1), (2049, 17, 3), (129, 65, 1), (1, 63, 1), (1, 64, 1)]:
         transformed = apply_program_grid_transforms(grid, contract,
                                                     physical_core_count=instance.launch_spec.physical_blocks)
+        assert transformed[0] * transformed[1] * transformed[2] <= 65535
         expected = [*grid[:2], *transformed]
         output.fill_(-1)
+        if not taskqueue:
+            torch.npu.synchronize()
         _run(instance, compiled, (output, ), grid=grid)
         torch.npu.synchronize()
         assert output.cpu().tolist() == expected
         output.fill_(-2)
+        if not taskqueue:
+            torch.npu.synchronize()
         _c_launch(instance, compiled, [ctypes.c_void_p(output.data_ptr())], grid=grid)
         torch.npu.synchronize()
         assert output.cpu().tolist() == expected
+
+
+@triton.jit
+def _dynamic_dot_rows(a, b, out, steps):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, 16)[:, None] * 16 + tl.arange(0, 16)[None, :]
+    lhs = tl.load(a + row * 256 + offsets)
+    acc = tl.full((16, 16), 0, tl.float32)
+    for step in range(steps):
+        rhs = tl.load(b + step * 256 + offsets)
+        acc = tl.dot(lhs, rhs, acc)
+    tl.store(out + row * 256 + offsets, acc)
+
+
+@pytest.mark.parametrize("taskqueue", [False, True])
+def test_compiler_dynamic_dot_row_launch(monkeypatch, taskqueue):
+    from triton.backends.ascend.program_grid import normalize_program_grid_transforms
+    from triton.backends.ascend.utils import is_compile_on_910_95
+    if not is_compile_on_910_95(triton.runtime.driver.active.get_current_target().arch):
+        pytest.skip("compiler DotRow mapping requires Ascend 950")
+    monkeypatch.setenv("TRITON_ENABLE_TASKQUEUE", str(taskqueue))
+    # Compile without a static grid hint so the real compiler inserts the
+    # original-grid ABI and tail masks. No metadata or signatures are replaced.
+    compiled = triton.compile(
+        ASTSource(_dynamic_dot_rows, signature={"a": "*fp16", "b": "*fp16", "out": "*fp32", "steps": "i32"},
+                  constexprs={}), options={"rule_mask": 8})
+    assert compiled.metadata.program_grid_mapping_applied
+    assert not compiled.metadata.row_coalescing_applied
+    contract = normalize_program_grid_transforms(compiled.metadata.program_grid_transforms)
+    assert [(t["axis"], t["factor"], t["persistent_coverage"]) for t in contract["transforms"]] == [(0, 8, False)]
+    instance = _native(compiled)
+    steps = 3
+    b_cpu = (torch.arange(steps * 256).reshape(steps, 16, 16) % 5 - 2).float()
+    b = b_cpu.to(device="npu", dtype=torch.float16)
+    for rows in (1, 7, 8, 9, 65):
+        # Guard rows make an unmasked final group observable without writing
+        # outside the allocation. Small integer inputs have an exact reference.
+        a_cpu = (torch.arange((rows + 8) * 256).reshape(rows + 8, 16, 16) % 7 - 3).float()
+        a = a_cpu.to(device="npu", dtype=torch.float16)
+        expected = a_cpu[:rows] @ b_cpu.sum(0)
+        out = torch.full((rows + 8, 16, 16), -777., device="npu")
+        for c_entry in (False, True):
+            out.fill_(-777.)
+            if not taskqueue:
+                # Direct CANN submission bypasses PyTorch's host queue. Finish
+                # input/sentinel initialization before testing the DotRow ABI.
+                torch.npu.synchronize()
+            if c_entry:
+                _c_launch(instance, compiled, [
+                    ctypes.c_void_p(a.data_ptr()),
+                    ctypes.c_void_p(b.data_ptr()),
+                    ctypes.c_void_p(out.data_ptr()),
+                    ctypes.c_int32(steps)
+                ], grid=(rows, 1, 1))
+            else:
+                _run(instance, compiled, (a, b, out, steps), grid=(rows, 1, 1))
+            torch.npu.synchronize()
+            actual = out.cpu()
+            assert torch.equal(actual[:rows], expected)
+            assert torch.all(actual[rows:] == -777.)

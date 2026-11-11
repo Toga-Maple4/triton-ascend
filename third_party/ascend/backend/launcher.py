@@ -27,10 +27,12 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 import sysconfig
 import tempfile
 from types import MappingProxyType
 
+from triton import knobs
 from triton.runtime.cache import get_cache_manager, get_dump_manager
 from . import utils
 from .program_grid import (ProgramGridContractError, get_persistent_transform, normalize_program_grid_transforms)
@@ -40,9 +42,9 @@ _LAUNCHER_CFLAGS = ("-O2", )
 
 # Keep these values in sync with launcher_abi.h. These are data tags, not C++
 # spellings: a signature is decoded once when a native plan is constructed.
-CONSTEXPR, POINTER, I8, I16, I32, I64, U8, U16, U32, U64, F32, F64 = range(12)
-FFTS, PURE_SIMT, TASKQUEUE, AUTO_MAP, GRID_WARNING, COALESCE_CEIL, DYNAMIC_SHARED, DEVICE_PRINT, IAT, PTSM = (
-    1 << i for i in range(10))
+CONSTEXPR, POINTER, I8, I16, I32, I64, U8, U16, U32, U64, F32, F64, F16, BF16 = range(14)
+FFTS, PURE_SIMT, TASKQUEUE, AUTO_MAP, GRID_WARNING, COALESCE_CEIL, DYNAMIC_SHARED, DEVICE_PRINT, IAT, PTSM, DOT_ROW, IAT64 = (
+    1 << i for i in range(12))
 
 _KINDS = {
     "constexpr": CONSTEXPR,
@@ -56,8 +58,8 @@ _KINDS = {
     "u16": U16,
     "u32": U32,
     "u64": U64,
-    "fp16": F32,
-    "bf16": F32,
+    "fp16": F16,
+    "bf16": BF16,
     "fp32": F32,
     "f32": F32,
     "fp64": F64,
@@ -78,11 +80,9 @@ def ty_to_cpp(ty):
         U64: "uint64_t",
         F32: "float",
         F64: "double",
+        F16: "float",
+        BF16: "float",
     }[_KINDS[ty]]
-
-
-def _enabled(name, default=False):
-    return os.getenv(name, str(default)).lower() in ("true", "1")
 
 
 @dataclass(frozen=True)
@@ -100,11 +100,13 @@ class LaunchSpec:
     mix_ratio: int
     shared_mem_dynamic_size: int
 
+    profile_scratch_size: int = 0
+
     def as_dict(self):
         return asdict(self)
 
 
-def _program_grid_flags(metadata):
+def _program_grid_config(metadata):
     # The compiler must explicitly report which rewriting and block-cap gates
     # applied. Missing fields must not silently select the legacy device ABI.
     for field in ("program_grid_mapping_applied", "row_coalescing_applied", "auto_blockify_enabled",
@@ -145,14 +147,17 @@ def _program_grid_flags(metadata):
     elif factor != 1 or axis != -1 or ceil_div:
         raise RuntimeError("unmatched RowCoalescing must retain default coalesce metadata")
     if transforms is None:
-        return 0
-    # Encode exactly the three version-2 sequences supported by the compiler.
-    # This extends the flag set without changing the version-1 C struct layout.
-    # Reject a future schema/sequence until its native implementation is added.
+        return COALESCE_CEIL if ceil_div else 0, factor, axis
+    # Encode the compiler's v2 sequences using the existing C spec fields.
+    # DOT_ROW uses X-axis ceil division like legacy coalescing, but also
+    # requires the originalGridX/Y hidden arguments of dynamic mappings.
     modes = {
-        ((1, 16, False, False), ): IAT,
-        ((1, 16, False, False), (0, 4, True, True)): IAT | PTSM,
-        ((0, 64, True, True), ): PTSM,
+        ((1, 16, False, False), ): (IAT, 1, -1),
+        ((1, 64, False, False), ): (IAT | IAT64, 1, -1),
+        ((1, 16, False, False), (0, 4, True, True)): (IAT | PTSM, 1, -1),
+        ((0, 64, True, True), ): (PTSM, 1, -1),
+        **{((0, factor, False, False), ): (DOT_ROW | COALESCE_CEIL, factor, 0)
+           for factor in (2, 4, 8, 16, 32)},
     }
     sequence = tuple((t["axis"], t["factor"], t["persistent_coverage"], t["grid_stride_abi_verified"])
                      for t in transforms["transforms"])
@@ -164,23 +169,21 @@ def _program_grid_flags(metadata):
 def make_launch_spec(metadata, npu_utils):
     """Translate compiler metadata without emitting native source code."""
     arch = metadata.target.arch
-    flags = _program_grid_flags(metadata)
+    flags, coalesce_factor, coalesce_axis = _program_grid_config(metadata)
     if utils.is_ffts_supported(arch) and not utils.force_disable_ffts(arch):
         flags |= FFTS
     if metadata.is_pure_simt:
         flags |= PURE_SIMT
-    if _enabled("TRITON_ENABLE_TASKQUEUE", True):
+    if knobs.ascend.enable_taskqueue:
         flags |= TASKQUEUE
     # The compiler owns AutoBlockify policy, including pure-SIMT exceptions
     # and compatibility with RowCoalescing/IAT. Do not recompute it at launch.
     if metadata.auto_blockify_enabled:
         flags |= AUTO_MAP
-    if _enabled("TRITON_GRID_WARN_PRINT"):
+    if knobs.ascend.grid_warn_print:
         flags |= GRID_WARNING
-    if _enabled("TRITON_DEVICE_PRINT"):
+    if knobs.ascend.device_print:
         flags |= DEVICE_PRINT
-    if getattr(metadata, "coalesce_grid_ceil_div", False):
-        flags |= COALESCE_CEIL
     enable_simt = "simt" in metadata.parallel_mode or metadata.is_pure_simt
     if metadata.compile_on_910_95 and enable_simt:
         flags |= DYNAMIC_SHARED
@@ -197,6 +200,7 @@ def make_launch_spec(metadata, npu_utils):
             task_type = candidate
     physical = npu_utils.get_aivector_core_num() if metadata.mix_mode == "aiv" else npu_utils.get_aicore_num()
     return LaunchSpec(
+        profile_scratch_size=int(getattr(metadata, "profile_scratch_size", 0) or 0),
         flags=flags,
         workspace_size=max(int(getattr(metadata, "workspace_size", 0)), 0),
         ordered_locks=ordered,
@@ -204,8 +208,8 @@ def make_launch_spec(metadata, npu_utils):
         lock_init_value=int(getattr(metadata, "lock_init_value", getattr(metadata, "lock_init_val", 0))),
         participant_factor=factor,
         physical_blocks=int(physical),
-        coalesce_factor=int(getattr(metadata, "coalesce_factor", 1) or 1),
-        coalesce_axis=int(getattr(metadata, "coalesce_axis", -1)),
+        coalesce_factor=coalesce_factor,
+        coalesce_axis=coalesce_axis,
         task_type=task_type,
         mix_ratio=mix_ratio,
         shared_mem_dynamic_size=int(getattr(metadata, "shared_mem_dynamic_size", 0)) if flags & DYNAMIC_SHARED else 0,
@@ -241,7 +245,7 @@ def argument_types(signature, constants=()):
     for index, sig in signature.items():
         for ty in _expand_signature(sig, constant_paths, (index, )):
             if ty.startswith("*"):
-                result.append((POINTER, utils.convert_sigtype_to_int(ty[1:])))
+                result.append((POINTER, utils.convert_sigtype_to_int(ty[1:].removeprefix("k"))))
             else:
                 result.append((_KINDS[ty], -1))
     return result
@@ -251,7 +255,7 @@ def make_tensordesc_arg(arg):
     return [arg.base, *arg.shape, *arg.strides, arg.padding == "nan", *arg.shape, *arg.strides]
 
 
-def wrap_handle_tensordesc(launcher, signature):
+def wrap_handle_tensordesc(launcher, signature, profile_scratch=False):
     signatures = tuple(signature.values())
     if not any(isinstance(sig, tuple) or sig.startswith("tensordesc") for sig in signatures):
         return launcher
@@ -266,10 +270,12 @@ def wrap_handle_tensordesc(launcher, signature):
         return [arg]
 
     def wrapped(*args):
-        if len(args) != 9 + len(signatures):
-            raise TypeError(f"launch expects {9 + len(signatures)} arguments, got {len(args)}")
-        flattened = [item for sig, value in zip(signatures, args[9:]) for item in expand(sig, value)]
-        return launcher(*args[:9], *flattened)
+        expected = 9 + len(signatures) + int(profile_scratch)
+        if len(args) != expected:
+            raise TypeError(f"launch expects {expected} arguments, got {len(args)}")
+        flattened = [item for sig, value in zip(signatures, args[9:9 + len(signatures)]) for item in expand(sig, value)]
+        scratch_args = args[-1:] if profile_scratch else ()
+        return launcher(*args[:9], *flattened, *scratch_args)
 
     return wrapped
 
@@ -296,13 +302,9 @@ def _runtime_sources():
     })
 
 
-def _cache_relative(path):
-    return "/".join(Path(path).parts[-2:])
-
-
 @lru_cache(maxsize=32)
-def _runtime_config(npu_utils_relative, backend, print_identity):
-    config = f"#define TRITON_NPU_UTILS_RELATIVE {json.dumps(npu_utils_relative)}\n"
+def _runtime_config(npu_utils_path, backend, print_identity):
+    config = f"#define TRITON_NPU_UTILS_PATH {json.dumps(npu_utils_path)}\n"
     if backend == "mindspore":
         config += "#define TRITON_LAUNCHER_MINDSPORE\n"
     sources = {"launcher_config.h": config}
@@ -318,10 +320,34 @@ def _shared_key(fingerprint, sources):
     return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
 
 
-def _build_shared(name, sources, debug=False):
-    fingerprint = utils.npu_extension_fingerprint(name, extra_cflags=_LAUNCHER_CFLAGS)
+def _python_link_flags():
+    """Link libpython into the launcher artifacts.
+
+    The exported C ABI is consumed from plain C processes (AOT), where the
+    artifacts are dlopened without a Python interpreter on the stack. Python
+    data symbols (e.g. PyExc_RuntimeError) must resolve eagerly at dlopen
+    time, so the artifacts link libpython themselves instead of relying on
+    the host process to provide it.
+    """
+    flags = []
+    libdir = sysconfig.get_config_var("LIBDIR")
+    if libdir:
+        flags += [f"-L{libdir}", f"-Wl,-rpath,{libdir}"]
+    flags += [f"-lpython{sys.version_info.major}.{sys.version_info.minor}"]
+    return tuple(flags)
+
+
+def _build_shared(name, sources, debug=False, bin_dir=None):
+    ldflags = _python_link_flags()
+    fingerprint = utils.npu_extension_fingerprint(name, extra_cflags=_LAUNCHER_CFLAGS, extra_ldflags=ldflags)
     key = _shared_key(json.dumps(fingerprint, sort_keys=True), tuple(sorted(sources.items())))
-    cache = get_cache_manager(key)
+    # bin_dir roots this shared artifact under a fixed installation directory
+    # instead of TRITON_CACHE_DIR (which PyTorch Inductor repoints per test
+    # case), keeping the artifact location tied to its content key.
+    if bin_dir is not None:
+        cache = utils.bin_cache_manager(key, bin_dir)
+    else:
+        cache = get_cache_manager(key)
     filename = name + sysconfig.get_config_var("EXT_SUFFIX")
     if debug:
         dump = get_dump_manager(key)
@@ -334,7 +360,7 @@ def _build_shared(name, sources, debug=False):
                 Path(temp, source_name).write_text(content)
             source_path = Path(temp,
                                "launcher_runtime.cpp" if name == "__triton_launcher_runtime" else "launcher_export.cpp")
-            built = utils._build_npu_ext(name, str(source_path), extra_cflags=_LAUNCHER_CFLAGS)
+            built = utils._build_npu_ext(name, str(source_path), extra_cflags=_LAUNCHER_CFLAGS, extra_ldflags=ldflags)
             return Path(built).read_bytes()
 
     return utils._get_or_build_npu_artifact(cache, filename, build)
@@ -349,18 +375,26 @@ def _load_runtime(path):
 
 
 def get_runtime(npu_utils_path, debug=False):
+    # The launcher bakes the helper's absolute path: a deleted or evicted
+    # artifact must be re-resolved (and rebuilt if needed) before the path is
+    # baked in.
+    if not os.path.exists(npu_utils_path):
+        from triton.backends.ascend.driver import NPUUtils
+        npu_utils_path = NPUUtils().get_so_path()
     print_identity = None
-    if _enabled("TRITON_DEVICE_PRINT"):
+    if knobs.ascend.device_print:
         # CANN/loaded framework replacement requires a new process. Track the
         # compiler selection and version-file identity for derived print code.
         bisheng = utils._get_bisheng_path()
         version_file = utils._find_cann_version_file()
         print_identity = (bisheng, utils._file_identity(bisheng), version_file,
                           utils._file_identity(version_file) if version_file else None)
-    sources = {
-        **_runtime_sources(), **_runtime_config(_cache_relative(npu_utils_path), utils.backend_policy, print_identity)
-    }
-    path = _build_shared("__triton_launcher_runtime", sources, debug)
+    sources = {**_runtime_sources(), **_runtime_config(npu_utils_path, utils.backend_policy, print_identity)}
+    # The runtime lands under the backend's in-package bin/ directory (with the
+    # helper), so repointing TRITON_CACHE_DIR no longer strands or rebuilds
+    # the pair; the runtime key embeds the helper's stable location.
+    bin_dir = Path(__file__).with_name("bin")
+    path = _build_shared("__triton_launcher_runtime", sources, debug, bin_dir=bin_dir)
     return _load_runtime(path), path
 
 
@@ -368,7 +402,7 @@ def export_launcher(spec, types, runtime_path, debug=False):
     """Bind the legacy C ABI using constants and a fixed export adapter."""
     fields = ", ".join(str(value) for value in spec.as_dict().values())
     initializers = ", ".join(f"{{{kind}, {dtype}}}" for kind, dtype in types) or "{0, -1}"
-    config = (f"#define TRITON_EXPORT_RUNTIME_RELATIVE {json.dumps(_cache_relative(runtime_path))}\n"
+    config = (f"#define TRITON_EXPORT_RUNTIME_PATH {json.dumps(runtime_path)}\n"
               f"static constexpr TritonNpuLaunchSpecV1 spec = {{1, sizeof(TritonNpuLaunchSpecV1), {fields}}};\n"
               f"static constexpr TritonNpuArgTypeV1 types[] = {{{initializers}}};\n"
               f"static constexpr size_t numTypes = {len(types)};\n")

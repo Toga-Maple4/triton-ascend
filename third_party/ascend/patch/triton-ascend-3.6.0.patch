@@ -697,7 +697,7 @@ index d4872a463..86348211d 100644
                  src=src,
                  metadata=res.metadata._asdict(),
                  metadata_group=metadata_group,
-@@ -321,7 +346,29 @@ def compile(src, target=None, options=None, _env_vars=None):
+@@ -321,7 +346,25 @@ def compile(src, target=None, options=None, _env_vars=None):
      if compilation_listener:
          timer.finished_ir_initialization()
      for ext, compile_ir in list(stages.items())[first_stage:]:
@@ -709,10 +709,6 @@ index d4872a463..86348211d 100644
 +                stage_name = "ConvertTritonIRToLinalgIR"
 +            elif (ext == "npubin"):
 +                stage_name = "ConvertLinalgIRToBinary"
-+            elif (ext == "bcmlir"):
-+                stage_name = "BytecodeToLinalgIRByBishengirOpt"
-+            elif (ext == "mlirbc"):
-+                stage_name = "LinalgIRToBytecodeByTritonMLIROpt"
 +            else:
 +                stage_name = "MLIRCompile"
 +            if hasattr(e, 'stderr') and e.stderr:
@@ -728,6 +724,17 @@ index d4872a463..86348211d 100644
          ir_filename = f"{file_name}.{ext}"
          if fn_override_manager is None:
              # Users can override kernels at scale by setting `ir_override` in autotune config
+@@ -331,8 +378,8 @@ def compile(src, target=None, options=None, _env_vars=None):
+         elif full_name := fn_override_manager.get_file(ir_filename):
+             print(f"\nOverriding kernel with file {full_name}")
+             next_module = parse(full_name, ext, context)
+-        # If TRITON_STORE_BINARY_ONLY is 1, only store cubin/hsaco/json
+-        if (not store_only_binary) or (ext in ("cubin", "hsaco", "json")):
++        # If TRITON_STORE_BINARY_ONLY is 1, only store the final binary.
++        if (not store_only_binary) or (ext in (backend.binary_ext, "json")):
+             metadata_group[ir_filename] = fn_cache_manager.put(next_module, ir_filename)
+         if fn_dump_manager is not None:
+             fn_dump_manager.put(next_module, ir_filename)
 @@ -354,8 +401,8 @@ def compile(src, target=None, options=None, _env_vars=None):
  
      # notify any listener
@@ -750,18 +757,6 @@ index d4872a463..86348211d 100644
      def __init__(self, src, metadata_group, hash):
          from collections import namedtuple
          metadata_path = next((Path(p) for c, p in metadata_group.items() if c.endswith(".json")))
-@@ -420,8 +469,10 @@ class CompiledKernel:
-         # stores the text of each level of IR that was generated during compilation
-         asm_files = [Path(p) for c, p in metadata_group.items() if not c.endswith(".json")]
-         binary_ext = backend.binary_ext
-+        binary_extensions = getattr(backend, 'binary_extensions', {binary_ext})
-         self.asm = AsmDict({
--            file.suffix[1:]: file.read_bytes() if file.suffix[1:] == binary_ext else file.read_text()
-+            file.suffix[1:]:
-+            file.read_bytes() if file.suffix[1:] in binary_extensions else file.read_text()
-             for file in asm_files
-         })
-         self.metadata_group = metadata_group
 @@ -432,8 +483,33 @@ class CompiledKernel:
          self.module = None
          self.function = None
@@ -994,17 +989,12 @@ index 42bf7024f..8ab2a95b2 100644
              raise ValueError("wrong type argument to unary invert (" + input_sca_ty.__repr__() + ")")
          _1 = self.tensor(self.builder.get_all_ones_value(input_sca_ty.to_ir(self.builder)), input_sca_ty)
          return self.xor_(input, _1)
-@@ -579,8 +629,11 @@ class TritonSemantic(Generic[TensorTy]):
+@@ -579,8 +629,6 @@ class TritonSemantic(Generic[TensorTy]):
          if end <= start:
              raise ValueError("arange's end argument must be greater than the start argument")
          range = end - start
 -        if (range & (range - 1)) != 0:
 -            raise ValueError("arange's range must be a power of 2")
-+        # Check if compile_mode is simt, then range must be a power of 2
-+        if self.builder.is_simt_mode():
-+            # Check if range is a power of 2
-+            if (range & (range - 1)) != 0:
-+                raise ValueError("arange's range must be a power of 2")
          shape = [range]
          if ret_ty is None:
              ret_ty = tl.block_type(tl.int32, shape)
@@ -1460,3 +1450,105 @@ index 0f506818f..9961a4eb2 100644
              # launch kernel
              launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
              kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,
+diff --git a/python/triton/tools/compile.py b/python/triton/tools/compile.py
+index 73085d3d3160..ee5eb6410dcd 100644
+--- a/python/triton/tools/compile.py
++++ b/python/triton/tools/compile.py
+@@ -194,6 +194,11 @@ def compile_kernel(args: CompileArgs):
+         "_placeholder": "",
+         "warp_size": target.warp_size,
+     }
++    if target.backend == "npu":
++        # NPU AOT: launcher export and template params live in the NPU tools package.
++        from triton.tools.extra.npu.aot import prepare_params
++
++        prepare_params(ccinfo, kernel, signature, constants, out_path, params, arg_names_not_1)
+     output_files = []
+     backend_name = target.backend
+     template_dir = Path(__file__).parent / "extra" / backend_name
+diff --git a/python/triton/tools/link.py b/python/triton/tools/link.py
+index 75a1157a52f9..a86605bfaf6a 100644
+--- a/python/triton/tools/link.py
++++ b/python/triton/tools/link.py
+@@ -4,6 +4,8 @@ from typing import Sequence, Union
+ 
+ from dataclasses import dataclass
+ 
++from triton.tools.extra.npu import aot
++
+ 
+ def _exists(x):
+     return x is not None
+@@ -36,7 +38,7 @@ class HeaderParser:
+         # [name, hash, suffix]
+         self.kernel_name = re.compile("^([\\w]+)_([\\w]+)_([\\w]+)$")
+         # [(type, name)]
+-        self.c_sig = re.compile("[\\s]*(\\w+)\\s(\\w+)[,]?")
++        self.c_sig = re.compile(aot.c_sig_pattern())
+         # [d|c]
+         self.arg_suffix = re.compile("[c,d]")
+ 
+@@ -174,8 +176,8 @@ def make_kernel_hints_dispatcher(name: str, metas: Sequence[KernelLinkerMeta]) -
+             if hint == 1  #
+             else None)
+         conds = " && ".join([  #
+-            cond_fn(val, hint)  #
+-            for val, hint in zip(meta.arg_names, meta.sizes)  #
++            aot.hint_condition(val, hint, ty)  #
++            for val, hint, ty in zip(meta.arg_names, meta.sizes, meta.arg_ctypes)  #
+             if hint is not None
+         ])
+         src += (f"  if ({conds})\n" if any(meta.sizes) else "if (1)\n"
+@@ -268,6 +270,12 @@ if __name__ == "__main__":
+         default="",
+         help="String to prefix kernel dispatcher names",
+     )
++    parser.add_argument(
++        "--backend",
++        type=str,
++        default="cuda",
++        help="Backend of the headers being linked (cuda|hip|npu); selects the result/stream types of the generated code (cuda.h for cuda|hip, NPU stand-ins for npu)",
++    )
+     args = parser.parse_args()
+ 
+     # metadata
+@@ -285,13 +293,21 @@ if __name__ == "__main__":
+     meta = meta_lists[0][0]
+     get_num_algos_decl = make_get_num_algos_decl(meta)
+     global_decl = make_global_decl(meta)
++    # CUDA/HIP take their types from <cuda.h>; the NPU toolchain ships no
++    # CUDA headers, so it supplies stand-ins and rewrites the type spellings.
++    if args.backend == "npu":
++        c_types_include = aot.c_types_include()
++    else:
++        c_types_include = "#include <cuda.h>"
+     with args.out.with_suffix(".h").open("w") as fp:
+-        out = "#include <cuda.h>\n"
++        out = c_types_include + "\n"
+         out += "\n".join(algo_decls)
+         out += "\n"
+         out += get_num_algos_decl
+         out += "\n"
+         out += global_decl
++        if args.backend == "npu":
++            out = aot.rewrite_types(out)
+         fp.write(out)
+ 
+     # generate source
+@@ -304,7 +322,7 @@ if __name__ == "__main__":
+     default_algo_kernel = make_default_algo_kernel(meta)
+     with args.out.with_suffix(".c").open("w") as fp:
+         out = ""
+-        out += "#include <cuda.h>\n"
++        out += c_types_include + "\n"
+         out += "#include <stdint.h>\n"
+         out += "#include <assert.h>\n"
+         out += "\n"
+@@ -319,4 +337,6 @@ if __name__ == "__main__":
+         out += load_unload_def
+         out += "\n"
+         out += default_algo_kernel
++        if args.backend == "npu":
++            out = aot.rewrite_types(out)
+         fp.write(out)
+

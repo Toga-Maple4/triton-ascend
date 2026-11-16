@@ -103,12 +103,14 @@ def _read_program_split_result(path: Path, metadata: dict) -> None:
     except (OSError, ValueError) as exc:
         raise RuntimeError(f"missing or invalid program-split result: {path}") from exc
     from copy import deepcopy
-    from triton.backends.ascend.l1_launch_contract import SCHEMA_VERSION, validate_compile_result
+    from triton.backends.ascend.l1_launch_contract import SCHEMA_VERSION, validate_compile_result, validate_profitability
     validate_compile_result(result, metadata)
+    validate_profitability(result.get("profitability"))
     # Install only validated facts; a failure must leave metadata untouched.
     for key in list(metadata):
         if key.startswith("l1_program_split_"):
             del metadata[key]
+    metadata["l1_program_split_profitability"] = deepcopy(result["profitability"])
     metadata["l1_program_split_schema"] = SCHEMA_VERSION
     metadata["l1_program_split_kind"] = result["kind"]
     if result["kind"] == "ordinary":
@@ -117,6 +119,24 @@ def _read_program_split_result(path: Path, metadata: dict) -> None:
         metadata["l1_program_split_runtime_contract"] = deepcopy(
             {k: result[k] for k in ("launch", "guard")})
 
+
+def _attach_program_split_failure(e):
+    """Preserve compiler facts on a failed attempt without inventing a binary."""
+    from triton.backends.ascend.l1_launch_contract import validate_profitability
+    lines = (e.stderr or b"").decode(errors="replace").splitlines()
+    prefix = "[program-split-profitability] "
+    records = [line[len(prefix):] for line in lines if line.startswith(prefix)]
+    if len(records) == 1:
+        try:
+            facts = json.loads(records[0])
+            facts.pop("function", None)
+            validate_profitability(facts)
+        except (ValueError, RuntimeError, AttributeError, TypeError):
+            pass  # Malformed evidence must not hide the compiler error.
+        else:
+            e.l1_program_split_profitability = facts
+            e.l1_program_split_filtered = (facts["decision"] == "filtered" and
+                "[program-split] filtered: compute_score_below_40" in lines)
 
 # TODO: materialize the concrete min shape
 def min_dot_size(target: GPUTarget):
@@ -454,7 +474,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
             ascend.passes.ttir.set_buffer_count(mod, "LOAD", _load_val)
 
         if opt.enable_l1_program_split and _supports_l1_program_split(opt.target_arch):
-            ascend.passes.ttir.add_l1_pointer_args_noalias(pm, 0)
+            ascend.passes.ttir.add_l1_prefetch_attach_noalias(pm, 0)
 
         if opt.debug:
             # Print the equivalent triton-opt command line so the pass
@@ -1031,6 +1051,8 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         try:
             ret = subprocess.run(cmd_list, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         except subprocess.CalledProcessError as e:
+            if opt.enable_l1_program_split:
+                _attach_program_split_failure(e)
             _save_bishengir_side_dumps(
                 linalg, metadata["hash"], cmd_list, e.stdout, e.stderr)
             if opt.debug:

@@ -205,11 +205,11 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
       py::arg("ub_safety_percent") = 80, py::arg("reserved_ub_bytes") = 0);
 
   // Materialize the caller promise only; semantic recognition stays in IR-Dev.
-  m.def("add_l1_pointer_args_noalias", [](mlir::PassManager &pm,
+  m.def("add_l1_prefetch_attach_noalias", [](mlir::PassManager &pm,
                                          unsigned onlyArgumentCount) {
-    AttachPointerArgsNoAliasOptions options;
+    L1PrefetchAttachNoaliasOptions options;
     options.onlyArgumentCount = onlyArgumentCount;
-    pm.addPass(mlir::triton::createAttachPointerArgsNoAliasPass(options));
+    pm.addPass(mlir::triton::createL1PrefetchAttachNoaliasPass(options));
   });
 
   m.def("set_buffer_count", [](mlir::ModuleOp &module, const std::string &type,

@@ -11,8 +11,10 @@ SPLIT_KIND = "split_mix_half_grid"
 # Runtime predicate identities, independent of internal recognizer names.
 REQUIRED_ROLES = {
     "fixed_programs": (),
+    "persistent_tiles": ("logical_programs", "persistent_steps", "row_tasks", "stride"),
     "tiles_2d": ("rows", "cols", "stride"),
     "flat_tiles": ("size",),
+    "program_tiles": ("input_strides",),
     "metadata_bounded_tiles": ("input_stride", "stride", "matrix_stride", "offsets"),
 }
 POINTER_BITS = {"*fp16": 16, "*bf16": 16, "*fp32": 32, "*fp64": 64,
@@ -42,7 +44,10 @@ def validate_runtime_contract(contract):
     extra = {"fixed": {"logical_programs"}, "half_grid": set(),
              "resident_pairs": {"resident_stride"}}
     _require(isinstance(mode, str) and mode in extra)
-    _require(set(launch) == {"distribution", "allow_odd_grid"} | extra[mode])
+    grid_fields = {"logical_grid"} if kind == "program_tiles" else set()
+    _require(set(launch) == {"distribution", "allow_odd_grid"} | extra[mode] | grid_fields)
+    if grid_fields:
+        _require(launch["logical_grid"] == "xyz")
     _require(type(launch["allow_odd_grid"]) is bool)
     if mode == "fixed":
         n = launch["logical_programs"]
@@ -53,8 +58,10 @@ def validate_runtime_contract(contract):
     # Stage-c compatibility boundary: preserve the existing physical schedules.
     # This coupling is not intrinsic to schema 2; schedule unification must lift
     # it together with the backend realization and its runtime premises.
-    expected = "fixed" if kind == "fixed_programs" else "half_grid" if kind == "tiles_2d" else "resident_pairs"
-    _require(mode == expected and launch["allow_odd_grid"] == (kind == "flat_tiles"))
+    expected = "fixed" if kind == "fixed_programs" else "half_grid" if kind in ("tiles_2d", "persistent_tiles") else "resident_pairs"
+    _require(mode == expected and launch["allow_odd_grid"] == (kind in ("flat_tiles", "program_tiles")))
+    if kind == "persistent_tiles":
+        _require(guard["tile_mode"] == "full")
     if kind == "flat_tiles":
         _require(tile["rows"] == 1 and guard["tile_mode"] == "partial")
     if kind == "metadata_bounded_tiles":
@@ -62,12 +69,17 @@ def validate_runtime_contract(contract):
     roles = guard["roles"]
     _require(isinstance(roles, dict) and set(roles) == {"inputs", "output"} | set(REQUIRED_ROLES[kind]))
     _require(isinstance(roles["inputs"], list) and bool(roles["inputs"]))
-    named = [("input", r) for r in roles["inputs"]] + [(k, v) for k, v in roles.items() if k != "inputs"]
+    if kind == "program_tiles":
+        _require(guard["tile_mode"] == "partial" and
+                 isinstance(roles["input_strides"], list) and
+                 len(roles["input_strides"]) == len(roles["inputs"]))
+    named = _named_roles(roles)
     pointers = []
     for name, role in named:
         _require(isinstance(role, dict))
         # Exactly one source; never give arg/const precedence.
-        _require(set(role) in ({"arg", "type"}, {"const", "type"}))
+        _require(set(role) in ({"arg", "type"}, {"const", "type"}) or
+                 kind == "persistent_tiles" and set(role) == {"grid", "type"})
         pointer = name in ("input", "output", "offsets")
         if pointer:
             _require("arg" in role and isinstance(role["type"], str) and role["type"] in POINTER_BITS)
@@ -76,18 +88,57 @@ def validate_runtime_contract(contract):
             _require(role["type"] == "i32")
         if "arg" in role:
             _require(type(role["arg"]) is int and 2 <= role["arg"] <= INT32_MAX)
+        elif "grid" in role:
+            _require(not pointer and role["grid"] in ("x", "y", "z"))
         else:
             _require(type(role["const"]) is int and -(1 << 31) <= role["const"] <= INT32_MAX)
+    if kind == "persistent_tiles":
+        stride = roles["stride"]
+        _require(set(stride) == {"const", "type"} and stride["const"] > 0
+                 and stride["const"] % tile["cols"] == 0)
     _require(len(set(pointers)) == len(pointers), "overlapping program-split pointer roles")
-    payloads = roles["inputs"] + [roles["output"]]
+    payloads = roles["inputs"] + ([] if kind == "program_tiles" else [roles["output"]])
     _require(len({r["type"] for r in payloads}) == 1 and
              all(POINTER_BITS[r["type"]] == tile["element_bits"] for r in payloads))
+
+
+def _named_roles(roles):
+    return ([("input", r) for r in roles["inputs"]] +
+            [(f"input_stride_{i}", r) for i, r in enumerate(roles.get("input_strides", []))] +
+            [(k, v) for k, v in roles.items() if k not in ("inputs", "input_strides")])
+
+
+def validate_profitability(facts):
+    """Validate reporting facts; the backend alone decides whether to retry.
+
+    This module participates in triton_key, so changing this policy invalidates
+    previously cached kernels, including binaries compiled without the filter.
+    """
+    import math
+    _require(isinstance(facts, dict) and set(facts) == {
+        "version", "threshold", "decision", "reason", "inputs", "compute_score"},
+        "missing or invalid New-L1 profitability facts; rebuild compiler")
+    score = facts["compute_score"]
+    _require(type(facts["version"]) is int and facts["version"] == 2
+             and type(facts["threshold"]) is int and facts["threshold"] == 40
+             and type(facts["inputs"]) is int and facts["inputs"] >= 0
+             and isinstance(facts["reason"], str)
+             and (score is None or type(score) in (int, float)
+                  and math.isfinite(score) and score >= 0),
+             "invalid New-L1 profitability facts")
+    decision = "unknown" if score is None else "filtered" if score < 40 else "passed"
+    _require(facts["decision"] == decision, "inconsistent New-L1 profitability decision")
 
 
 def validate_compile_result(result, metadata):
     _require(isinstance(result, dict))
     if type(result.get("schema_version")) is not int or result["schema_version"] != SCHEMA_VERSION:
         raise RuntimeError("unsupported program-split result schema; recompile kernel")
+    if "profitability" in result:
+        validate_profitability(result["profitability"])
+        _require(result.get("kind") != SPLIT_KIND or result["profitability"]["decision"] != "filtered",
+                 "filtered New-L1 candidate produced a split binary")
+        result = {k: v for k, v in result.items() if k != "profitability"}
     if "compile_options" in result:
         options = result["compile_options"]
         flags = {"enable_vf_fusion", "disable_vf_reachable_check", "enable_auto_multi_buffer"}
@@ -129,7 +180,8 @@ def physical_block_count(contract):
     launch = contract["launch"]
     if launch["distribution"] == "fixed":
         return str(launch["logical_programs"] // 2)
-    half = "((int64_t)gridX + 1) / 2" if launch["allow_odd_grid"] else "gridX / 2"
+    grid = "((int64_t)gridX * gridY * gridZ)" if launch.get("logical_grid") == "xyz" else "gridX"
+    half = f"((int64_t){grid} + 1) / 2" if launch["allow_odd_grid"] else "gridX / 2"
     if launch["distribution"] == "resident_pairs":
         return f"std::min<int64_t>({half}, {launch['resident_stride']})"
     return half
@@ -145,9 +197,12 @@ def _bind_roles(contract, constants, signature):
             if ty != "constexpr" and i not in constants and (i,) not in constants]
     roles = contract["guard"]["roles"]
     values, indices = {}, {}
-    for name, role in [("input", r) for r in roles["inputs"]] + [(k, v) for k, v in roles.items() if k != "inputs"]:
+    for name, role in _named_roles(roles):
         if "const" in role:
             values[name] = str(role["const"])
+            continue
+        if "grid" in role:
+            values[name] = "grid" + role["grid"].upper()
             continue
         index = role["arg"] - 2  # TTAdapter hidden pointers are not public args.
         _require(index < len(args) and args[index][1] == role["type"],
@@ -188,11 +243,69 @@ def emit_runtime_guards(contract, constants, signature, max_physical_blocks):
     guard, launch = contract["guard"], contract["launch"]
     kind = guard["kind"]
     bm, bn, bits = (guard["tile"][k] for k in ("rows", "cols", "element_bits"))
+    if kind == "program_tiles":
+        stride = launch["resident_stride"]
+        names = tuple(f"input_stride_{i}" for i in range(len(guard["roles"]["inputs"])))
+        params = ''.join(f", int64_t {name}" for name in names)
+        checks = ' || '.join(f"{name} < {bn} || {name} > {INT32_MAX}LL" for name in names)
+        predicate = f'''
+static bool valid_program_tiles(int gridX, int gridY, int gridZ{params}) {{
+  if (gridX <= 0 || gridY <= 0 || gridZ <= 0) return false;
+  // Bound each product before multiplying; backend program IDs are i32.
+  int64_t programs = gridX;
+  if (programs > {INT32_MAX}LL / gridY) return false;
+  programs *= gridY;
+  if (programs > {INT32_MAX - 2 * stride}LL / gridZ) return false;
+  programs *= gridZ;
+  if ({checks}) return false;
+  int64_t pairs = (programs + 1) / 2;
+  return (pairs < {stride} ? pairs : {stride}) <= {max_physical_blocks};
+}}
+'''
+        return _emit_checks(predicate, "valid_program_tiles", names, args, values, indices,
+                            "split MIX program grid/transfer stride violates the runtime contract")
     if kind == "fixed_programs":
         logical = launch["logical_programs"]
         predicate = f"static bool valid_fixed_program_split(int gridX, int gridY, int gridZ) {{ return gridX == {logical} && gridY == 1 && gridZ == 1 && {logical // 2} <= {max_physical_blocks}; }}\n"
         return _emit_checks(predicate, "valid_fixed_program_split", (), args, values, indices,
                             "split MIX requires its compiled logical grid")
+    if kind == "persistent_tiles":
+        # These premises prove the existing q + N*floor(i/C) partition in its
+        # actual i32/index domain, including inactive-payload comparisons.
+        stride = guard["roles"]["stride"]["const"]
+        columns = stride // bn
+        names = ("logical_programs", "persistent_steps", "row_tasks", "stride")
+        predicate = f'''
+static bool valid_persistent_tiles(int gridX, int gridY, int gridZ,
+                                   int64_t logical_programs, int64_t persistent_steps,
+                                   int64_t row_tasks, int64_t stride) {{
+  if (logical_programs <= 0 || logical_programs > {INT32_MAX}LL ||
+      gridX != logical_programs || gridX % 2 || gridY != 1 || gridZ != 1 ||
+      gridX / 2 > {max_physical_blocks} ||
+      persistent_steps <= 0 || persistent_steps > {INT32_MAX}LL ||
+      row_tasks <= 0 || row_tasks > {INT32_MAX}LL || stride != {stride}) return false;
+  int64_t round = (persistent_steps - 1) / {columns};
+  if (round > ({INT32_MAX}LL - (logical_programs - 1)) / logical_programs) return false;
+  int64_t tmax = logical_programs - 1 + logical_programs * round;
+  int64_t last = row_tasks - 1 < tmax ? row_tasks - 1 : tmax;
+  if (last > {INT32_MAX // bm}LL) return false;
+  int64_t column = persistent_steps - 1 - (last / logical_programs) * {columns};
+  if (column >= {columns}) column = {columns - 1};
+  int64_t tail = column * {bn}LL + {bn - 1};
+  int64_t last_row = last * {bm}LL + {bm - 1};
+  return last_row <= ({INT64_MAX // (bits // 8)}LL - tail) / stride;
+}}
+'''
+        predicate, py, c = _emit_checks(
+            predicate, "valid_persistent_tiles", names, args, values, indices,
+            "persistent_launch_domain_violation")
+        def diagnostic(n):
+            return (f'(gridX != {n} ? "persistent_grid_count_mismatch" : '
+                    '"persistent_launch_domain_violation")')
+        py = py.replace('"persistent_launch_domain_violation"', diagnostic(values["logical_programs"]))
+        c = c.replace('fprintf(stderr, "Error: persistent_launch_domain_violation\\n");',
+                      'fprintf(stderr, "Error: %s\\n", ' + diagnostic("split_logical_programs") + ');')
+        return predicate, py, c
     if kind == "tiles_2d":
         partial = guard["tile_mode"] == "partial"
         shape_alignment = "false" if partial else f"rows % {bm} || cols % {bn}"

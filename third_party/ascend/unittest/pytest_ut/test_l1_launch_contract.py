@@ -31,7 +31,8 @@ def assign_npu():
     yield
 
 
-def test_contract_schema_changes_the_full_compilation_cache_key(tmp_path):
+@pytest.mark.parametrize("change", ["schema", "contract_body"])
+def test_contract_schema_changes_the_full_compilation_cache_key(tmp_path, change):
     """A schema change misses a populated cache and reruns the compiler pipeline."""
     import triton.backends.ascend.l1_launch_contract as contract
 
@@ -48,7 +49,8 @@ def test_contract_schema_changes_the_full_compilation_cache_key(tmp_path):
         original = path.read_bytes()
         marker = ('SCHEMA_VERSION = ' + sys.argv[2]).encode()
         assert original.count(marker) == 1
-        changed = original.replace(marker, ('SCHEMA_VERSION = ' + str(int(sys.argv[2]) + 1)).encode())
+        changed = (original.replace(marker, ('SCHEMA_VERSION = ' + str(int(sys.argv[2]) + 1)).encode())
+                   if sys.argv[5] == 'schema' else original + b'\\n# additive runtime-kind implementation\\n')
         real_open = builtins.open
         intercepted = []
         def read_schema(file, mode='r', *args, **kwargs):
@@ -64,7 +66,7 @@ def test_contract_schema_changes_the_full_compilation_cache_key(tmp_path):
         # backend stage and device-handle construction are replaced by host fakes.
         os.environ['TRITON_CACHE_DIR'] = sys.argv[4]
         os.environ['TRITON_ALWAYS_COMPILE'] = '0'
-        version = int(sys.argv[2]) + (sys.argv[3] == 'changed')
+        version = int(sys.argv[2]) + (sys.argv[3] == 'changed' and sys.argv[5] == 'schema')
         calls = []
         class Options:
             def hash(self): return 'unchanged'
@@ -100,7 +102,7 @@ def test_contract_schema_changes_the_full_compilation_cache_key(tmp_path):
 
     def cache_key(version):
         result = subprocess.run(
-            [sys.executable, '-c', script, contract.__file__, str(SCHEMA_VERSION), version, str(tmp_path / 'cache')],
+            [sys.executable, '-c', script, contract.__file__, str(SCHEMA_VERSION), version, str(tmp_path / 'cache'), change],
             check=True, capture_output=True, text=True)
         return json.loads(result.stdout.splitlines()[-1])
 
@@ -109,7 +111,7 @@ def test_contract_schema_changes_the_full_compilation_cache_key(tmp_path):
     hit = cache_key('original')
     assert hit == {**before, 'compiled': 0}
     changed = cache_key('changed')
-    assert changed['compiled'] == 1 and changed['schema'] == SCHEMA_VERSION + 1
+    assert changed['compiled'] == 1 and changed['schema'] == SCHEMA_VERSION + (change == 'schema')
     assert changed['cache_key'] != before['cache_key']
     assert changed['full_key'] != before['full_key']
     assert cache_key('changed') == {**changed, 'compiled': 0}
@@ -452,7 +454,7 @@ def test_result_metadata_roundtrip_and_cache_hit(tmp_path, fixture):
     from triton.backends.ascend.compiler import _read_program_split_result
     meta = dict(target=SimpleNamespace(arch='Ascend950PR_9589'), mix_mode='aiv')
     result = dict(schema_version=SCHEMA_VERSION, kind='split_mix_half_grid',
-                  target=meta['target'].arch, **fixture)
+                  target=meta['target'].arch, profitability=profitability(72), **fixture)
     path = tmp_path / 'kernel.program_split.json'
     path.write_text(json.dumps(result))
     _read_program_split_result(path, meta)
@@ -462,6 +464,7 @@ def test_result_metadata_roundtrip_and_cache_hit(tmp_path, fixture):
     cached = json.loads(json.dumps({k: v for k, v in meta.items() if k != 'target'}))
     validate_launch_metadata(SimpleNamespace(**cached), 1)
     assert cached['l1_program_split_schema'] == SCHEMA_VERSION
+    assert cached['l1_program_split_profitability'] == profitability(72)
 
 
 @pytest.mark.parametrize('content', [None, '{', '{}', '{"schema_version":1}',
@@ -487,7 +490,7 @@ def test_concurrent_private_result_directories():
     def compile_result(index):
         with TemporaryDirectory() as directory:
             path = Path(directory) / 'kernel.program_split.json'
-            result = dict(schema_version=SCHEMA_VERSION, kind='ordinary', reason=str(index))
+            result = dict(schema_version=SCHEMA_VERSION, kind='ordinary', reason=str(index), profitability=profitability(None))
             path.write_text(json.dumps(result))
             meta = dict(l1_program_split_runtime_contract=CONTRACT)
             _read_program_split_result(path, meta)
@@ -731,3 +734,75 @@ def test_three_input_reordered_constant_rows_launchers(tmp_path, specialized, ti
     assert python_guard in wrapper and c_guard in wrapper
     assert 'void triton_launch_kernel(' in wrapper
     assert wrapper.count('uint32_t blockNum = gridX / 2;') == 2
+
+
+def profitability(score):
+    return dict(version=2, threshold=40, compute_score=score, inputs=2,
+                reason="test", decision="unknown" if score is None else
+                "filtered" if score < 40 else "passed")
+
+
+@pytest.mark.parametrize("score", [None, 0, 39.999, 40, 40.001, 184])
+def test_profitability_boundary_and_ordinary_metadata(tmp_path, score):
+    from triton.backends.ascend.compiler import _read_program_split_result
+    from triton.backends.ascend.l1_launch_contract import validate_profitability
+    facts = profitability(score)
+    validate_profitability(facts)
+    path = tmp_path / "kernel.program_split.json"
+    path.write_text(json.dumps(dict(schema_version=2, kind="ordinary",
+                                   reason="ordinary_compiled", profitability=facts)))
+    meta = {}
+    _read_program_split_result(path, meta)
+    assert meta["l1_program_split_profitability"] == facts
+    assert meta["l1_program_split_kind"] == "ordinary"
+    validate_launch_metadata(SimpleNamespace(**meta), 1)
+
+
+@pytest.mark.parametrize("update", [dict(compute_score=-1), dict(compute_score=float("nan")),
+    dict(compute_score=float("inf")), dict(compute_score=True), dict(threshold=64),
+    dict(version=1), dict(decision="filtered"), dict(inputs=True), dict(extra=0)])
+def test_invalid_profitability_rejected(update):
+    from triton.backends.ascend.l1_launch_contract import validate_profitability
+    with pytest.raises(RuntimeError):
+        validate_profitability(dict(profitability(72), **update))
+
+
+def test_missing_policy_and_filtered_split_do_not_install_metadata(tmp_path):
+    from triton.backends.ascend.compiler import _read_program_split_result
+    meta = dict(target=SimpleNamespace(arch="Ascend950PR_9589"), mix_mode="aiv")
+    result = dict(schema_version=2, kind="split_mix_half_grid", target=meta["target"].arch, **CONTRACT)
+    path = tmp_path / "kernel.program_split.json"
+    for facts in (None, profitability(30)):
+        if facts is not None:
+            result["profitability"] = facts
+        path.write_text(json.dumps(result))
+        before = deepcopy(meta)
+        with pytest.raises(RuntimeError):
+            _read_program_split_result(path, meta)
+        assert meta == before
+
+
+@pytest.mark.parametrize("score,marker,expected", [(30, True, True), (30, False, False),
+    (40, True, False), (None, True, False)])
+def test_failed_compilation_retains_score_without_hiding_other_errors(score, marker, expected):
+    import subprocess
+    from triton.backends.ascend.compiler import _attach_program_split_failure
+    text = "[program-split-profitability] " + json.dumps(dict(profitability(score), function="example"))
+    if marker:
+        text += "\n[program-split] filtered: compute_score_below_40"
+    error = subprocess.CalledProcessError(1, ["compiler"], stderr=text.encode())
+    _attach_program_split_failure(error)
+    assert error.l1_program_split_profitability == profitability(score)
+    assert error.l1_program_split_filtered is expected
+
+
+@pytest.mark.parametrize("records", [[], ["{"], ["[]"], ["{}"],
+    [json.dumps(profitability(30)), json.dumps(profitability(30))]])
+def test_missing_malformed_or_ambiguous_diagnostics_remain_compile_errors(records):
+    import subprocess
+    from triton.backends.ascend.compiler import _attach_program_split_failure
+    text = "\n".join("[program-split-profitability] " + r for r in records)
+    text += "\n[program-split] filtered: compute_score_below_40"
+    error = subprocess.CalledProcessError(1, ["compiler"], stderr=text.encode())
+    _attach_program_split_failure(error)
+    assert not hasattr(error, "l1_program_split_filtered")

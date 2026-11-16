@@ -9,7 +9,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/Support/Debug.h"
 
-#define DEBUG_TYPE "l1-attach-pointer-args-noalias"
+#define DEBUG_TYPE "l1-prefetch-attach-noalias"
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -34,11 +34,11 @@ bool isKernelEntry(Operation *operation)
 /// This is the ONLY writer of the contract. The analyses read it and never
 /// synthesize it, so the contract cannot be conjured by the very pass that
 /// benefits from believing it.
-AttachPointerArgsNoAliasPass::AttachPointerArgsNoAliasPass(
-    const AttachPointerArgsNoAliasOptions &options)
-    : AttachPointerArgsNoAliasBase(options) {}
+L1PrefetchAttachNoaliasPass::L1PrefetchAttachNoaliasPass(
+    const L1PrefetchAttachNoaliasOptions &options)
+    : L1PrefetchAttachNoaliasBase(options) {}
 
-void AttachPointerArgsNoAliasPass::runOnOperation()
+void L1PrefetchAttachNoaliasPass::runOnOperation()
 {
     ModuleOp module = getOperation();
     module.walk([&](FunctionOpInterface function) {
@@ -47,12 +47,12 @@ void AttachPointerArgsNoAliasPass::runOnOperation()
         if (onlyArgumentCount && function.getNumArguments() != onlyArgumentCount)
             return;
         function->setAttr(ascend::kPointerArgsNoAliasAttr, UnitAttr::get(module.getContext()));
-        LLVM_DEBUG(llvm::dbgs() << "[l1-attach-pointer-args-noalias] " << function.getName() << "\n");
+        LLVM_DEBUG(llvm::dbgs() << "[l1-prefetch-attach-noalias] " << function.getName() << "\n");
     });
 }
 
-std::unique_ptr<OperationPass<ModuleOp>> mlir::triton::createAttachPointerArgsNoAliasPass(
-    const AttachPointerArgsNoAliasOptions &options)
+std::unique_ptr<OperationPass<ModuleOp>> mlir::triton::createL1PrefetchAttachNoaliasPass(
+    const L1PrefetchAttachNoaliasOptions &options)
 {
-    return std::make_unique<AttachPointerArgsNoAliasPass>(options);
+    return std::make_unique<L1PrefetchAttachNoaliasPass>(options);
 }

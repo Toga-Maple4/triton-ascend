@@ -1,5 +1,5 @@
 add_triton_library(L1SoftwarePrefetchCommon
-  AttachPointerArgsNoAliasPass.cpp
+  L1PrefetchAttachNoalias.cpp
 
   DEPENDS
   L1SoftwarePrefetchPassIncGen

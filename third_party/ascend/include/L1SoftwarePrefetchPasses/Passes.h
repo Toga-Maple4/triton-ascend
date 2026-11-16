@@ -9,17 +9,17 @@
 
 using namespace mlir;
 
-#define GEN_PASS_DECL_ATTACHPOINTERARGSNOALIAS
+#define GEN_PASS_DECL_L1PREFETCHATTACHNOALIAS
 #include "ascend/include/L1SoftwarePrefetchPasses/Passes.h.inc"
 
-#define GEN_PASS_DEF_ATTACHPOINTERARGSNOALIAS
+#define GEN_PASS_DEF_L1PREFETCHATTACHNOALIAS
 #include "ascend/include/L1SoftwarePrefetchPasses/Passes.h.inc"
 
 namespace mlir {
 namespace triton {
 
-std::unique_ptr<OperationPass<ModuleOp>> createAttachPointerArgsNoAliasPass(
-    const AttachPointerArgsNoAliasOptions &options = {});
+std::unique_ptr<OperationPass<ModuleOp>> createL1PrefetchAttachNoaliasPass(
+    const L1PrefetchAttachNoaliasOptions &options = {});
 
 #define GEN_PASS_REGISTRATION
 #include "ascend/include/L1SoftwarePrefetchPasses/Passes.h.inc"
@@ -29,10 +29,10 @@ std::unique_ptr<OperationPass<ModuleOp>> createAttachPointerArgsNoAliasPass(
 
 namespace {
 
-class AttachPointerArgsNoAliasPass
-    : public ::impl::AttachPointerArgsNoAliasBase<AttachPointerArgsNoAliasPass> {
+class L1PrefetchAttachNoaliasPass
+    : public ::impl::L1PrefetchAttachNoaliasBase<L1PrefetchAttachNoaliasPass> {
 public:
-  explicit AttachPointerArgsNoAliasPass(const AttachPointerArgsNoAliasOptions &options);
+  explicit L1PrefetchAttachNoaliasPass(const L1PrefetchAttachNoaliasOptions &options);
   void runOnOperation() override;
 };
 

@@ -1,4 +1,4 @@
-// RUN: triton-opt %s '--l1-attach-pointer-args-noalias=only-argument-count=14' | FileCheck %s
+// RUN: triton-opt %s '--l1-prefetch-attach-noalias=only-argument-count=14' | FileCheck %s
 
 // The two-input caller contract is attached to the final TTAdapter ABI only.
 // Helpers and other kernel arities do not acquire a promise from this option.

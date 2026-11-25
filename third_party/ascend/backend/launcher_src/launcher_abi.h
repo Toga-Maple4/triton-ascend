@@ -42,6 +42,8 @@ enum TritonNpuArgKind {
   TRITON_NPU_U64,
   TRITON_NPU_F32,
   TRITON_NPU_F64,
+  TRITON_NPU_F16,
+  TRITON_NPU_BF16,
 };
 
 enum TritonNpuLaunchFlag {
@@ -55,9 +57,17 @@ enum TritonNpuLaunchFlag {
   TRITON_NPU_DEVICE_PRINT = 1 << 7,
   // program_grid_transforms v2: IAT divides Y by 16; PTSM divides X by
   // 64 (alone) or 4 (with IAT), then caps X using physical_blocks.
-  // Either flag adds originalGridX/Y before the transformed device grid.
+  // Each dynamic mapping adds originalGridX/Y before the transformed grid.
   TRITON_NPU_IAT = 1 << 8,
   TRITON_NPU_PTSM = 1 << 9,
+  // DotRow divides X by coalesce_factor (2/4/8/16/32), with ceil division.
+  // It is mutually exclusive with IAT/PTSM and has no persistent X-axis cap.
+  TRITON_NPU_DOT_ROW = 1 << 10,
+  // Modifier for standalone IAT: divide Y by 64 instead of 16.
+  // Requires IAT and cannot be combined with PTSM. The argument ABI is
+  // unchanged.
+  TRITON_NPU_IAT64 = 1 << 11,
+  TRITON_NPU_ATOMIC_REMOVE = 1 << 12,
 };
 
 typedef struct {
@@ -76,12 +86,27 @@ typedef struct {
   int64_t lock_init_value;
   uint32_t participant_factor;
   uint32_t physical_blocks;
+  // Legacy coalescing or dynamic DotRow when TRITON_NPU_DOT_ROW is set.
   uint32_t coalesce_factor;
   int32_t coalesce_axis;
   uint32_t task_type;
   uint32_t mix_ratio;
   uint32_t shared_mem_dynamic_size;
+  uint64_t profile_scratch_size;
 } TritonNpuLaunchSpecV1;
+
+/* V2 is an independent envelope; the published V1 layout is unchanged.
+ * The request layout remains TritonNpuLaunchRequestV1. Original G[3] is
+ * appended before the transformed launch grid in the kernel argument buffer. */
+typedef struct {
+  uint32_t version;
+  uint32_t struct_size;
+  TritonNpuLaunchSpecV1 base;
+  uint32_t grid_contract_version;
+  int32_t batch_axis;
+  uint32_t batch_factor;
+  uint32_t reserved;
+} TritonNpuLaunchSpecV2;
 
 typedef struct {
   uint32_t version;
@@ -94,6 +119,7 @@ typedef struct {
   const int *shape_dims;
   const int *tensor_kinds;
   int num_tensors;
+  void *profile_scratch;
 } TritonNpuLaunchRequestV1;
 
 typedef struct TritonNpuLaunchPlan TritonNpuLaunchPlan;
@@ -102,6 +128,7 @@ typedef struct TritonNpuLaunchPlan TritonNpuLaunchPlan;
  * copies argument VALUES before returning. Device allocations referenced by
  * pointer arguments remain subject to the caller's stream/lifetime contract.
  * An error buffer, when supplied, always receives a null-terminated string.
+ * F16/BF16 C argument buffers contain the encoded 16-bit device value.
  * No C++ exception or Python object crosses this ABI. */
 TritonNpuLaunchPlan *
 triton_npu_create_plan_v1(const TritonNpuLaunchSpecV1 *spec,
@@ -112,6 +139,16 @@ int triton_npu_launch_v1(const TritonNpuLaunchPlan *plan,
                          const TritonNpuLaunchRequestV1 *request,
                          const void *const *args, const size_t *arg_sizes,
                          size_t num_args, char *error, size_t error_size);
+
+TritonNpuLaunchPlan *
+triton_npu_create_plan_v2(const TritonNpuLaunchSpecV2 *spec,
+                          const TritonNpuArgTypeV1 *types, size_t num_types,
+                          char *error, size_t error_size);
+int triton_npu_launch_v2(const TritonNpuLaunchPlan *plan,
+                         const TritonNpuLaunchRequestV1 *request,
+                         const void *const *args, const size_t *arg_sizes,
+                         size_t num_args, char *error, size_t error_size);
+uint32_t triton_npu_program_grid_contract_version(void);
 
 #ifdef __cplusplus
 }

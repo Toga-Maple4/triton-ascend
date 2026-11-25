@@ -33,7 +33,7 @@ struct Adapter {
   PyObject *(*python_launcher)(const TritonNpuLaunchPlan *);
   TritonNpuLaunchPlan *plan;
   Adapter() {
-    void *runtime = triton::ascend::openRuntime(TRITON_EXPORT_RUNTIME_RELATIVE);
+    void *runtime = triton::ascend::openRuntime(TRITON_EXPORT_RUNTIME_PATH);
     auto create = triton::ascend::resolve<decltype(&triton_npu_create_plan_v1)>(
         runtime, "triton_npu_create_plan_v1");
     launch = triton::ascend::resolve<decltype(launch)>(runtime,
@@ -69,7 +69,8 @@ extern "C" void triton_launch_kernel(const char *name, void *function,
         name,   function,
         stream, {gridX, gridY, gridZ},
         shapes, ranks,
-        kinds,  num_tensors};
+        kinds,  num_tensors,
+        nullptr};
     char error[512];
     int ret = adapter.launch(adapter.plan, &request, args, sizes, num_args,
                              error, sizeof(error));

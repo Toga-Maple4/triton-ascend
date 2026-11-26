@@ -1,0 +1,137 @@
+
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
+#include <memory>
+
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/LogicalResult.h"
+
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/Pass/Pass.h"
+
+#include "ascend/include/DynamicCVPipeline/Common/ScopeOpUtils.h"
+#include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "ascend/include/DynamicCVPipeline/SplitDataflowPass.h"
+
+#include "bishengir/Dialect/Scope/IR/Scope.h"
+
+static constexpr const char *DEBUG_TYPE = "SplitDataflow";
+#define DBGS(...) LLVM_DEBUG(llvm::dbgs() << __VA_ARGS__)
+#define LOG_DEBUG(...) DBGS("[" << DEBUG_TYPE << "] " << __VA_ARGS__)
+
+using namespace mlir;
+using namespace CVPipeline;
+
+namespace {
+
+/// Stamps `attrs` on `op` and on every op nested in its regions.
+///
+/// The scope tags describe the packed unit, not one op: `block_id` names the
+/// block it runs in, `core_type` names the core.
+/// Readers look at an op's own attributes, never at an enclosing op's.
+/// Pre: a moved-out loop keeps its own region, so its body must be stamped
+/// too, otherwise later matches read that work as unclassified.
+static void stampUnitAttrs(Operation *op, ArrayRef<NamedAttribute> attrs) {
+  for (const NamedAttribute &attr : attrs) {
+    op->setAttr(attr.getName(), attr.getValue());
+  }
+  // A linalg region holds the op's payload, not a unit of work.
+  // The classifier never tags those nested ops either.
+  if (op->getDialect() && isa<linalg::LinalgDialect>(op->getDialect())) {
+    return;
+  }
+  for (Region &region : op->getRegions()) {
+    for (Block &block : region) {
+      for (Operation &nested : block) {
+        stampUnitAttrs(&nested, attrs);
+      }
+    }
+  }
+}
+
+class UnpackScopePass
+    : public PassWrapper<UnpackScopePass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(UnpackScopePass)
+
+  UnpackScopePass() = default;
+
+  void runOnOperation() override {
+    auto module = getOperation();
+    if (hasFallbackAttr(module)) {
+      return;
+    }
+    // Collect first, then unpack: `unpackScopeOp` erases the scope, so
+    // mutating inside a `walk` callback would invalidate its traversal stack.
+    // A post-order walk visits a nested scope before its parent, and unpacking
+    // the inner one only moves ops out of the outer body.
+    SmallVector<scope::ScopeOp> scopes;
+    module.walk([&](scope::ScopeOp scopeOp) { scopes.push_back(scopeOp); });
+
+    for (scope::ScopeOp scopeOp : scopes) {
+      llvm::SmallVector<Operation *> unpackedOps;
+      // `ssbuffer.load` marks the packed unit, a property of the scope.
+      // The unpacked ops must not inherit it.
+      SmallVector<NamedAttribute> attrs;
+      for (const NamedAttribute &attr : scopeOp->getAttrs()) {
+        if (attr.getName() == kScopeLoadAttr) {
+          continue;
+        }
+        attrs.push_back(attr);
+      }
+      if (unpackScopeOp(scopeOp, &unpackedOps).failed()) {
+        LOG_DEBUG("Failed to unpack scopeOp: " << scopeOp << "\n");
+        setFallbackAttr(module, ERRCODE_FAILED);
+        return;
+      }
+      // The scope is trusted to carry `block_id`: a scope without it is an
+      // upstream bug, reported by the passes that consume `block_id` later.
+      for (Operation *op : unpackedOps) {
+        stampUnitAttrs(op, attrs);
+      }
+    }
+    LOG_DEBUG("After UnpackScopeOp : " << module << "\n");
+  }
+
+  [[nodiscard]] llvm::StringRef getArgument() const final {
+    return "ssbuf-unpack-scopeop";
+  }
+
+  /// Return the dialect that must be loaded in the context before this pass.
+  void getDependentDialects(::mlir::DialectRegistry &registry) const override {
+    registry.insert<scope::ScopeDialect>();
+  }
+};
+
+} // namespace
+
+namespace mlir::triton {
+
+std::unique_ptr<OperationPass<ModuleOp>> createUnpackScopePass() {
+  return std::make_unique<UnpackScopePass>();
+}
+
+} // namespace mlir::triton

@@ -93,16 +93,22 @@ struct TritonFpToFpToHFusionConversion : OpRewritePattern<triton::FpToFpOp> {
     // arith.truncf/extf. Check this before querying tensor-only properties:
     // scalar fp_to_fp operations are valid Triton IR too.
     auto roundingMode = op.getRounding();
-    if (!roundingMode.has_value() ||
-        roundingMode.value() == triton::RoundingMode::RTNE) {
+    const bool isHiF8 =
+        isa<HiFloat8Type>(getElementTypeOrSelf(input.getType())) ||
+        isa<HiFloat8Type>(getElementTypeOrSelf(resultType));
+    if (!isHiF8 && (!roundingMode.has_value() ||
+                    roundingMode.value() == triton::RoundingMode::RTNE)) {
       // RTNE or no rounding mode specified: let TritonToLinalg handle it
       return failure();
     }
 
     // HFusion owns only non-RTNE tensor conversions. Keep the tensor
     // precondition checked here; a scalar must not silently fall through.
-    auto srcType = cast<TensorType>(input.getType());
-    auto dstType = cast<TensorType>(resultType);
+    auto srcType = dyn_cast<TensorType>(input.getType());
+    auto dstType = dyn_cast<TensorType>(resultType);
+    if (!srcType || !dstType)
+      return rewriter.notifyMatchFailure(op,
+                                         "HFusion conversion requires tensors");
     if (!srcType.getElementType().isIntOrFloat() ||
         !dstType.getElementType().isIntOrFloat()) {
       return failure();
@@ -110,7 +116,13 @@ struct TritonFpToFpToHFusionConversion : OpRewritePattern<triton::FpToFpOp> {
 
     // Map non-RTNE rounding modes to HFusion rounding mode
     hfusion::RoundMode hfusionRoundMode;
-    switch (roundingMode.value()) {
+    switch (roundingMode.value_or(triton::RoundingMode::RTA)) {
+    case triton::RoundingMode::RTA:
+      hfusionRoundMode = hfusion::RoundMode::ROUND;
+      break;
+    case triton::RoundingMode::HYBRID:
+      hfusionRoundMode = hfusion::RoundMode::HYBRID;
+      break;
     case triton::RoundingMode::RTZ:
       hfusionRoundMode = hfusion::RoundMode::TRUNC;
       break;
@@ -127,7 +139,7 @@ struct TritonFpToFpToHFusionConversion : OpRewritePattern<triton::FpToFpOp> {
     // Create the HFusion cast operation with round_mode attribute
     auto roundModeAttr =
         hfusion::RoundModeAttr::get(rewriter.getContext(), hfusionRoundMode);
-    auto modeAttr = rewriter.getNamedAttr("mode", roundModeAttr);
+    auto modeAttr = rewriter.getNamedAttr("round_mode", roundModeAttr);
 
     rewriter.replaceOpWithNewOp<hfusion::CastOp>(
         op, ValueRange{input}, ValueRange{dsts}, ArrayRef{modeAttr});
@@ -148,9 +160,27 @@ struct TritonConv1dToHFusionConversion
     Value weight = op.getWeight();
     Value biasValue = op.getBias();
     int64_t stride = op.getStride();
-    int64_t padding_size = op.getPaddingSize();
     int64_t dilation = op.getDilation();
     int64_t groups = op.getGroups();
+
+    // Parse padding: an integer (uniform scalar) or a 2-element
+    // [pad_left, pad_right] array.
+    auto parseParam =
+        [](Attribute attr) -> std::optional<SmallVector<int64_t>> {
+      if (auto intAttr = dyn_cast<IntegerAttr>(attr))
+        return SmallVector<int64_t>{intAttr.getInt()};
+      if (auto arrayAttr = dyn_cast<DenseI32ArrayAttr>(attr)) {
+        SmallVector<int64_t> values;
+        for (int32_t v : arrayAttr.asArrayRef())
+          values.push_back(static_cast<int64_t>(v));
+        return values;
+      }
+      return std::nullopt;
+    };
+    auto padding = parseParam(op.getPadding());
+    if (!padding || padding->empty() || padding->size() > 2) {
+      return failure();
+    }
 
     auto inputType = mlir::cast<RankedTensorType>(input.getType());
     auto weightType = mlir::cast<RankedTensorType>(weight.getType());
@@ -169,11 +199,20 @@ struct TritonConv1dToHFusionConversion
     int64_t C_out = weightShape[0];
     int64_t kernel_size = weightShape[2];
 
+    // Expand padding to [pad_left, pad_right].
+    SmallVector<int64_t> pads;
+    if (padding->size() == 1) {
+      pads.assign(2, (*padding)[0]);
+    } else {
+      pads.assign(padding->begin(), padding->end());
+    }
+
     if (stride == 0) {
       return failure();
     }
+    // pads = [pad_left, pad_right]
     int64_t L_out =
-        (L_in + 2 * padding_size - dilation * (kernel_size - 1) - 1) / stride +
+        (L_in + pads[0] + pads[1] - dilation * (kernel_size - 1) - 1) / stride +
         1;
 
     auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
@@ -199,8 +238,17 @@ struct TritonConv1dToHFusionConversion
       ins.push_back(biasValue);
     }
 
+    // Preserve the user's form: an integer stays a scalar IntegerAttr, a
+    // 2-element sequence stays [pad_left, pad_right]. `pads` (the 2-element
+    // expansion) is only used for the output-dim computation above.
+    Attribute paddingAttr;
+    if (padding->size() == 1)
+      paddingAttr = rewriter.getI64IntegerAttr((*padding)[0]);
+    else
+      paddingAttr = rewriter.getDenseI64ArrayAttr(*padding);
+
     auto newOp = rewriter.create<hfusion::Conv1DOp>(
-        loc, ins, initTensor, stride, padding_size, dilation, groups);
+        loc, ins, initTensor, stride, paddingAttr, dilation, groups);
 
     rewriter.replaceOp(op, newOp.getResult());
 

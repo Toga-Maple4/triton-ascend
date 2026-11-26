@@ -23,9 +23,8 @@
 #ifndef TRITON_ADAPTER_OP_CLASSIFIER_H
 #define TRITON_ADAPTER_OP_CLASSIFIER_H
 
-#include "ascend/include/DynamicCVPipeline/Common/MemoryEffectsTracker.h"
-#include "bishengir/Dialect/Annotation/IR/Annotation.h"
-#include "bishengir/Dialect/HIVM/IR/HIVM.h"
+#include "llvm/Support/LogicalResult.h"
+
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -36,6 +35,12 @@
 #include "mlir/IR/Value.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
+
+#include "ascend/include/DynamicCVPipeline/Common/MemoryEffectsTracker.h"
+
+#include "bishengir/Dialect/Annotation/IR/Annotation.h"
+#include "bishengir/Dialect/HIVM/IR/HIVM.h"
+#include "bishengir/Dialect/Scope/IR/Scope.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 namespace mlir {
@@ -65,10 +70,13 @@ public:
   static constexpr ::llvm::StringRef getArgumentName() {
     return "op-classifier";
   }
+
   ::llvm::StringRef getArgument() const override { return "op-classifier"; }
+
   ::llvm::StringRef getDescription() const override {
     return "Classify operations as CUBE or VECTOR for dynamic CV pipeline";
   }
+
   ::llvm::StringRef getName() const override { return "OpClassifierPass"; }
 
 private:
@@ -76,6 +84,11 @@ private:
 
   // Map from operation to its core type
   llvm::DenseMap<Operation *, OpCoreType> opCoreTypes;
+
+  // Ops whose core type was already decided before this pass (e.g. packed
+  // scope units carrying `ssbuffer.core_type`). Their type is authoritative
+  // and they act as propagation boundaries.
+  llvm::DenseSet<Operation *> preClassifiedOps;
 
   // Cache: value -> whether its defining chain reaches a VECTOR-only op.
   // Memoizes hasVectorOnlyProducer during CUBE upstream propagation.
@@ -86,6 +99,9 @@ private:
 
   // Seed operations for CUBE upstream propagation
   llvm::SmallVector<Operation *> cubeSeeds;
+  // Casts represented by the producer's FIXPIPE must remain CUBE-only. Their
+  // downstream users define the CUBE-to-VECTOR boundary.
+  llvm::DenseSet<Operation *> fixpipeOutputCastOps;
   // if A*B+C's C from broadcast chain, they need to keep for Normalize.
   llvm::DenseSet<Operation *> inBroadcastChain;
 
@@ -102,7 +118,7 @@ private:
   int patternMatchCUBE();
 
   // Upstream pattern matching helpers
-  void matchToTensorPattern(Operation *def);
+  void matchLoadPattern(Operation *def);
   void matchTransposePattern(Operation *def);
   void matchFillPattern(Operation *def);
   void matchEmptyPattern(Operation *def);
@@ -111,8 +127,9 @@ private:
 
   // Downstream pattern matching helpers
   void matchStorePattern(Operation *user);
-  void matchExtractSlicePattern(Operation *user);
+  void matchExtractSlicePattern(Operation *user, bool sameBlock);
   void matchMaterializePattern(Operation *user);
+  void matchFixpipeOutputCastPatterns();
 
   // Propagate CUBE core type upstream
   int propagateCubeUpstream();
@@ -155,6 +172,12 @@ private:
   OpCoreType getCoreType(Operation *op) const;
   OpCoreType getForInitCoreType(OpOperand *operand) const;
 
+  // True if `def` genuinely produces the carried value on the VECTOR side:
+  // a region-less VECTOR compute op (e.g. tensor arith/math). Region
+  // containers are excluded (their op-level core type is unreliable).
+  // The producer op itself is obtained via CVPipeline::getLoopCarriedDefOp.
+  bool isVectorProducerOp(Operation *def) const;
+
   // Set the core type of an operation
   void setCoreType(Operation *op, OpCoreType coreType);
 
@@ -178,7 +201,7 @@ private:
   // Step 6: Handle CUBE_AND_VECTOR operations
   int handleCubeAndVector();
 
-  // Helper: split CUBE_AND_VECTOR operation into CUBE and VECTOR versions
+  // Splits a CUBE_AND_VECTOR operation into CUBE and VECTOR versions.
   void splitOperationForCubeAndVector(
       Operation *op, llvm::DenseSet<Operation *> &processedOps,
       llvm::DenseMap<Operation *, Operation *> &opToVectorClone);

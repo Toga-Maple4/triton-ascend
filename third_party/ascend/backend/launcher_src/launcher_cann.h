@@ -22,6 +22,21 @@
 #pragma once
 #include "runtime/runtime/rt.h"
 #include <acl/acl.h>
+#include <dlfcn.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#ifndef TT_AOT_KERNEL_TYPES
+#define TT_AOT_KERNEL_TYPES
+typedef int NPUresult;
+typedef void *NPUstream;
+#define ASCEND_SUCCESS 0
+#define ASCEND_ERROR_UNKNOWN 1
+#define ASCEND_ERROR_INVALID_VALUE 2
+#endif
+
+#ifdef __cplusplus
 // Compatibility shim for CANN runtime API transition (rt -> aclrt in 9.0.0).
 #ifdef TRITON_CANN_910
 using cann_error = aclError;
@@ -37,9 +52,11 @@ static inline cann_error cann_malloc_host(void **ptr, size_t size) {
 static inline cann_error cann_free_host(void *ptr) {
   return aclrtFreeHost(ptr);
 }
-static inline cann_error cann_memcpy(void *dst, size_t destMax, const void *src,
-                                     size_t count, cann_memcpy_kind kind) {
-  return aclrtMemcpy(dst, destMax, src, count, kind);
+static inline cann_error cann_memcpy_async(void *dst, size_t destMax,
+                                           const void *src, size_t count,
+                                           cann_memcpy_kind kind,
+                                           cann_stream stream) {
+  return aclrtMemcpyAsync(dst, destMax, src, count, kind, stream);
 }
 static inline cann_error cann_memset_async(void *dst, size_t destMax,
                                            int32_t value, size_t count,
@@ -86,9 +103,11 @@ static inline cann_error cann_malloc_host(void **ptr, size_t size) {
   return rtMallocHost(ptr, size, RT_MEMORY_HOST);
 }
 static inline cann_error cann_free_host(void *ptr) { return rtFreeHost(ptr); }
-static inline cann_error cann_memcpy(void *dst, size_t destMax, const void *src,
-                                     size_t count, cann_memcpy_kind kind) {
-  return rtMemcpy(dst, destMax, src, count, kind);
+static inline cann_error cann_memcpy_async(void *dst, size_t destMax,
+                                           const void *src, size_t count,
+                                           cann_memcpy_kind kind,
+                                           cann_stream stream) {
+  return rtMemcpyAsync(dst, destMax, src, count, kind, stream);
 }
 static inline cann_error cann_memset_async(void *dst, size_t destMax,
                                            int32_t value, size_t count,
@@ -124,3 +143,197 @@ cann_get_launch_kernel_cfg(uint32_t shared_mem_dynamic_size) {
   return &cfgInfo;
 }
 #endif
+
+// Queue-disabled eager launches retain their synchronous contract. Capturing a
+// stream records the task instead: synchronizing it would invalidate the graph.
+static inline bool cann_stream_is_capturing(cann_stream stream) {
+#ifdef TRITON_CANN_910
+  aclmdlRICaptureStatus status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+  aclmdlRI model = nullptr;
+  return aclmdlRICaptureGetInfo(stream, &status, &model) == ACL_SUCCESS &&
+         status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
+#else
+  (void)stream;
+  return false;
+#endif
+}
+
+#endif // __cplusplus
+
+// NPU AOT stubs shared by the generated C sources (tools/extra/npu/compile.c);
+// only compiled when the stub defines NPU_AOT_USE_ACL (the harness compile
+// does not see -DTRITON_CANN_910). CANN >= 9.1 must register via the ACL
+// binary-load API to match aclrtLaunchKernelWithHostArgs; older CANN uses
+// rt-style registration passed through to rtKernelLaunch.
+#ifdef NPU_AOT_USE_ACL
+static inline void npuAotSetDevice(void) {
+  // Re-assert the device selected by the embedding process instead of
+  // assuming device 0.
+  int32_t device = 0;
+  aclError ret = aclrtGetDevice(&device);
+  if (ret != ACL_SUCCESS) {
+    printf("Triton Error [NPU]: aclrtGetDevice failed: 0x%x\n", ret);
+    exit(ret);
+  }
+  ret = aclrtSetDevice(device);
+  if (ret != ACL_SUCCESS) {
+    printf("Triton Error [NPU]: aclrtSetDevice failed: 0x%x\n", ret);
+    exit(ret);
+  }
+}
+
+// Register the embedded binary and return the launch handle; mix_aiv selects
+// the vector-core magic, stub_slot stores the rt-style function stub.
+static inline void *npuAotRegister(const unsigned char *data, size_t size,
+                                   const char *kernel_name,
+                                   const char *stub_name, int mix_aiv,
+                                   void *stub_slot) {
+#if NPU_AOT_USE_ACL
+  (void)stub_name;
+  (void)stub_slot;
+  aclrtBinaryLoadOption optArr[2];
+  optArr[0].type = ACL_RT_BINARY_LOAD_OPT_LAZY_LOAD;
+  optArr[0].value.isLazyLoad = 0;
+  optArr[1].type = ACL_RT_BINARY_LOAD_OPT_MAGIC;
+  optArr[1].value.magic = mix_aiv ? ACL_RT_BINARY_MAGIC_ELF_VECTOR_CORE
+                                  : ACL_RT_BINARY_MAGIC_ELF_AICORE;
+  aclrtBinaryLoadOptions loadOptions = {optArr, 2};
+  aclrtBinHandle binHandle = NULL;
+  aclError ret =
+      aclrtBinaryLoadFromData(data, (uint32_t)size, &loadOptions, &binHandle);
+  if (ret != ACL_SUCCESS) {
+    printf("aclrtBinaryLoadFromData failed: 0x%x\n", ret);
+    exit(1);
+  }
+  aclrtFuncHandle funcHandle = NULL;
+  ret = aclrtBinaryGetFunction(binHandle, kernel_name, &funcHandle);
+  if (ret != ACL_SUCCESS) {
+    printf("aclrtBinaryGetFunction failed(name = %s): 0x%x\n", kernel_name,
+           ret);
+    exit(1);
+  }
+  return funcHandle;
+#else
+  rtDevBinary_t devbin;
+  devbin.data = (void *)data;
+  devbin.length = (uint32_t)size;
+  devbin.magic =
+      mix_aiv ? RT_DEV_BINARY_MAGIC_ELF_AIVEC : RT_DEV_BINARY_MAGIC_ELF;
+  devbin.version = 0;
+  void *devbinHandle = NULL;
+  rtError_t ret = rtDevBinaryRegister(&devbin, &devbinHandle);
+  if (ret != RT_ERROR_NONE) {
+    printf("rtDevBinaryRegister failed: 0x%x\n", ret);
+    exit(1);
+  }
+  ret = rtFunctionRegister(devbinHandle, stub_slot, stub_name,
+                           (void *)kernel_name, 0);
+  if (ret != RT_ERROR_NONE) {
+    printf("rtFunctionRegister failed(stubName = %s): 0x%x\n", stub_name, ret);
+    exit(1);
+  }
+  return stub_slot;
+#endif
+}
+
+// Per-kernel launch policy embedded in each generated stub. Keep the layout in
+// sync with launcher_abi.h (TritonNpuArgTypeV1 / TritonNpuLaunchSpecV1).
+typedef struct npu_aot_arg_type_t {
+  uint32_t kind;
+  int32_t dtype;
+} npu_aot_arg_type_t;
+
+typedef struct npu_aot_launch_spec_t {
+  uint32_t version;
+  uint32_t struct_size;
+  uint64_t flags;
+  uint64_t workspace_size;
+  uint64_t ordered_locks;
+  uint64_t unordered_locks;
+  int64_t lock_init_value;
+  uint32_t participant_factor;
+  uint32_t physical_blocks;
+  uint32_t coalesce_factor;
+  int32_t coalesce_axis;
+  uint32_t task_type;
+  uint32_t mix_ratio;
+  uint32_t shared_mem_dynamic_size;
+  uint64_t profile_scratch_size;
+} npu_aot_launch_spec_t;
+
+// Function-pointer forms of triton_launch_kernel_create/run in
+// launcher_export.so
+typedef void *(*npu_aot_create_plan_t)(const npu_aot_launch_spec_t *spec,
+                                       const npu_aot_arg_type_t *types,
+                                       size_t num_types);
+typedef int (*npu_aot_run_plan_t)(void *plan, const char *name, void *function,
+                                  void *stream, int gridX, int gridY, int gridZ,
+                                  void *const *args, const size_t *sizes,
+                                  int num_args);
+
+struct npu_aot_plan_entry_t {
+  const npu_aot_launch_spec_t *spec;
+  const npu_aot_arg_type_t *types;
+  size_t num_types;
+  void *plan;
+  struct npu_aot_plan_entry_t *next;
+};
+
+// Launch through the generic C export, caching one plan per spec/types.
+// Each stub passes its own static spec/types, so the pointer tuple identifies
+// its plan.
+static inline NPUresult
+npuAotLaunch(const char *name, void *function, void *stream, int gridX,
+             int gridY, int gridZ, const npu_aot_launch_spec_t *spec,
+             const npu_aot_arg_type_t *types, size_t num_types,
+             void *const *args, const size_t *sizes, int num_args) {
+  static void *lib_handle = NULL;
+  static npu_aot_create_plan_t create_plan = NULL;
+  static npu_aot_run_plan_t run_plan = NULL;
+  static struct npu_aot_plan_entry_t *plans = NULL;
+  struct npu_aot_plan_entry_t *entry = NULL;
+  if (create_plan == NULL) {
+    lib_handle = dlopen("launcher_export.so", RTLD_LAZY | RTLD_LOCAL);
+    if (lib_handle == NULL) {
+      fprintf(stderr,
+              "Triton Error [NPU]: cannot dlopen launcher_export.so: %s\n",
+              dlerror());
+      return ASCEND_ERROR_UNKNOWN;
+    }
+    create_plan =
+        (npu_aot_create_plan_t)dlsym(lib_handle, "triton_launch_kernel_create");
+    run_plan =
+        (npu_aot_run_plan_t)dlsym(lib_handle, "triton_launch_kernel_run");
+    if (create_plan == NULL || run_plan == NULL) {
+      fprintf(stderr,
+              "Triton Error [NPU]: cannot resolve the generic C launcher\n");
+      return ASCEND_ERROR_UNKNOWN;
+    }
+  }
+  for (entry = plans; entry != NULL; entry = entry->next) {
+    if (entry->spec == spec && entry->types == types &&
+        entry->num_types == num_types)
+      break;
+  }
+  if (entry == NULL) {
+    void *plan = create_plan(spec, types, num_types);
+    if (plan == NULL)
+      return ASCEND_ERROR_UNKNOWN;
+    entry = (struct npu_aot_plan_entry_t *)malloc(sizeof(*entry));
+    if (entry == NULL) {
+      fprintf(stderr, "Triton Error [NPU]: cannot cache the launch plan\n");
+      return ASCEND_ERROR_UNKNOWN;
+    }
+    entry->spec = spec;
+    entry->types = types;
+    entry->num_types = num_types;
+    entry->plan = plan;
+    entry->next = plans;
+    plans = entry;
+  }
+  if (run_plan(entry->plan, name, function, stream, gridX, gridY, gridZ, args,
+               sizes, num_args) != 0)
+    return ASCEND_ERROR_UNKNOWN;
+  return ASCEND_SUCCESS;
+}
+#endif // NPU_AOT_USE_ACL

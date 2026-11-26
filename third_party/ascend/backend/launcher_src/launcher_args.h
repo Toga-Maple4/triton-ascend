@@ -32,6 +32,37 @@
 
 namespace triton::ascend {
 
+// Encode scalar arguments using round-to-nearest-even, preserving Inf/NaN.
+inline uint16_t floatToFP16(float value) {
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  uint16_t sign = (bits >> 16) & 0x8000;
+  uint32_t magnitude = bits & 0x7fffffff;
+  if (magnitude >= 0x7f800000)
+    return sign | (magnitude > 0x7f800000 ? 0x7e00 : 0x7c00);
+  if (magnitude >= 0x477ff000)
+    return sign | 0x7c00;
+  if (magnitude <= 0x33000000)
+    return sign;
+  if (magnitude < 0x38800000) {
+    uint32_t significand = (magnitude & 0x7fffff) | 0x800000;
+    unsigned shift = 126 - (magnitude >> 23);
+    uint32_t rounding =
+        ((1u << (shift - 1)) - 1) + ((significand >> shift) & 1);
+    return sign | ((significand + rounding) >> shift);
+  }
+  return sign |
+         ((magnitude - 0x38000000 + 0xfff + ((magnitude >> 13) & 1)) >> 13);
+}
+
+inline uint16_t floatToBF16(float value) {
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  if ((bits & 0x7fffffff) > 0x7f800000)
+    return (bits >> 16) | 0x40;
+  return (bits + 0x7fff + ((bits >> 16) & 1)) >> 16;
+}
+
 inline size_t checkedAdd(size_t a, size_t b) {
   if (b > std::numeric_limits<size_t>::max() - a)
     throw std::overflow_error("launcher argument size overflow");
@@ -52,11 +83,21 @@ struct ArgSlot {
   size_t size;
 };
 
+// Internal representation; it never crosses the C ABI.
+struct LaunchSpec : TritonNpuLaunchSpecV1 {
+  uint32_t gridContractVersion = 0;
+  int32_t batchAxis = -1;
+  uint32_t batchFactor = 1;
+  LaunchSpec() : TritonNpuLaunchSpecV1{} {}
+  LaunchSpec(const TritonNpuLaunchSpecV1 &base) : TritonNpuLaunchSpecV1(base) {}
+};
+
 struct ArgLayout {
   static constexpr size_t absent = std::numeric_limits<size_t>::max();
   std::vector<ArgSlot> args;
   size_t inputCount = 0;
   size_t ffts = absent, lock = absent, workspace = absent;
+  size_t profile = absent;
   size_t originalGrid = absent, grid = absent, debug = absent, total = 0;
 
   size_t reserve(size_t size, size_t alignment) {
@@ -66,7 +107,7 @@ struct ArgLayout {
     return offset;
   }
 
-  ArgLayout(const TritonNpuLaunchSpecV1 &spec, const TritonNpuArgTypeV1 *types,
+  ArgLayout(const LaunchSpec &spec, const TritonNpuArgTypeV1 *types,
             size_t count)
       : inputCount(count) {
     static_assert(sizeof(void *) == 8,
@@ -91,6 +132,8 @@ struct ArgLayout {
         break;
       case TRITON_NPU_I16:
       case TRITON_NPU_U16:
+      case TRITON_NPU_F16:
+      case TRITON_NPU_BF16:
         size = 2;
         break;
       case TRITON_NPU_I32:
@@ -112,12 +155,17 @@ struct ArgLayout {
       args.push_back(
           {i, kind, types[i].dtype, reserve(size, size == 8 ? 8 : 4), size});
     }
-    if (spec.flags & (TRITON_NPU_IAT | TRITON_NPU_PTSM))
+    if (spec.profile_scratch_size && !(spec.flags & TRITON_NPU_PURE_SIMT))
+      profile = reserve(8, 8);
+    if (spec.gridContractVersion == 3)
+      originalGrid = reserve(3 * sizeof(uint32_t), 4);
+    else if (spec.flags & (TRITON_NPU_IAT | TRITON_NPU_PTSM |
+                           TRITON_NPU_DOT_ROW | TRITON_NPU_ATOMIC_REMOVE))
       originalGrid = reserve(2 * sizeof(uint32_t), 4);
     grid = reserve(3 * sizeof(int32_t), 4);
     if (spec.flags & TRITON_NPU_PURE_SIMT) {
-      reserve(8, 8); // global scratch
-      reserve(8, 8); // profile scratch
+      reserve(8, 8);           // global scratch
+      profile = reserve(8, 8); // profile scratch
     }
     debug = reserve(8, 8); // present even when device print is disabled
   }
@@ -141,11 +189,24 @@ struct ArgLayout {
 inline void validateSpec(const TritonNpuLaunchSpecV1 &spec) {
   if (spec.version != 1 || spec.struct_size != sizeof(spec))
     throw std::invalid_argument("unsupported launcher spec ABI");
-  if (spec.flags & ~uint64_t(1023))
+  if (spec.flags & ~uint64_t(8191))
     throw std::invalid_argument("unknown launcher flags");
+  if ((spec.flags & TRITON_NPU_IAT64) &&
+      (!(spec.flags & TRITON_NPU_IAT) || (spec.flags & TRITON_NPU_PTSM)))
+    throw std::invalid_argument("IAT64 requires standalone IAT");
   if (!spec.coalesce_factor || spec.coalesce_axis < -1 ||
       spec.coalesce_axis > 2)
     throw std::invalid_argument("invalid launcher coalescing configuration");
+  if ((spec.flags & TRITON_NPU_ATOMIC_REMOVE) &&
+      (spec.coalesce_axis != 0 || spec.coalesce_factor > INT32_MAX ||
+       (spec.flags & TRITON_NPU_COALESCE_CEIL)))
+    throw std::invalid_argument("invalid grouped reduction launch spec");
+  if ((spec.flags & TRITON_NPU_DOT_ROW) &&
+      ((spec.flags & (TRITON_NPU_IAT | TRITON_NPU_PTSM)) ||
+       spec.coalesce_axis != 0 || !(spec.flags & TRITON_NPU_COALESCE_CEIL) ||
+       spec.coalesce_factor < 2 || spec.coalesce_factor > 32 ||
+       (spec.coalesce_factor & (spec.coalesce_factor - 1))))
+    throw std::invalid_argument("invalid dynamic DotRow configuration");
   if ((spec.flags & (TRITON_NPU_IAT | TRITON_NPU_PTSM)) &&
       (spec.coalesce_factor != 1 || spec.coalesce_axis != -1 ||
        (spec.flags & TRITON_NPU_COALESCE_CEIL)))
@@ -160,19 +221,54 @@ inline void validateSpec(const TritonNpuLaunchSpecV1 &spec) {
     throw std::invalid_argument("invalid profiling task configuration");
 }
 
+inline LaunchSpec decodeSpecV2(const TritonNpuLaunchSpecV2 &spec) {
+  static_assert(sizeof(TritonNpuLaunchSpecV1) == 88);
+  static_assert(sizeof(TritonNpuLaunchSpecV2) == 112);
+  static_assert(offsetof(TritonNpuLaunchSpecV2, base) == 8);
+  static_assert(offsetof(TritonNpuLaunchSpecV2, grid_contract_version) ==
+                8 + sizeof(TritonNpuLaunchSpecV1));
+  if (spec.version != 2 || spec.struct_size != sizeof(spec) ||
+      spec.grid_contract_version != 3 || spec.reserved || spec.batch_axis < 0 ||
+      spec.batch_axis > 2 || spec.batch_factor < 2 ||
+      spec.batch_factor > INT32_MAX)
+    throw std::invalid_argument("invalid V2 block batching launch contract");
+  validateSpec(spec.base);
+  if (spec.base.flags & (TRITON_NPU_IAT | TRITON_NPU_PTSM | TRITON_NPU_DOT_ROW |
+                         TRITON_NPU_COALESCE_CEIL | TRITON_NPU_PURE_SIMT) ||
+      spec.base.coalesce_factor != 1 || spec.base.coalesce_axis != -1)
+    throw std::invalid_argument(
+        "block batching conflicts with another mapping or SIMT");
+  LaunchSpec result(spec.base);
+  result.gridContractVersion = 3;
+  result.batchAxis = spec.batch_axis;
+  result.batchFactor = spec.batch_factor;
+  return result;
+}
+
 struct LaunchGrid {
   std::array<int32_t, 3> grid;
-  uint32_t logicalBlocks, physicalBlocks;
+  uint64_t logicalBlocks;
+  uint32_t physicalBlocks;
 };
 
-inline LaunchGrid prepareGrid(const TritonNpuLaunchSpecV1 &spec,
-                              const int32_t *input) {
+inline LaunchGrid prepareGrid(const LaunchSpec &spec, const int32_t *input) {
   LaunchGrid result{{input[0], input[1], input[2]}, 0, 0};
+  if (spec.gridContractVersion == 3) {
+    for (auto dim : result.grid)
+      if (dim < 0)
+        throw std::invalid_argument("negative original grid extent");
+  }
   for (auto dim : result.grid)
     if (dim <= 0)
       return result;
-  if (spec.flags & TRITON_NPU_IAT)
-    result.grid[1] = (int64_t(input[1]) + 15) / 16;
+  if (spec.gridContractVersion == 3)
+    result.grid[spec.batchAxis] =
+        (int64_t(input[spec.batchAxis]) + spec.batchFactor - 1) /
+        spec.batchFactor;
+  if (spec.flags & TRITON_NPU_IAT) {
+    const uint32_t factor = (spec.flags & TRITON_NPU_IAT64) ? 64 : 16;
+    result.grid[1] = (int64_t(input[1]) + factor - 1) / factor;
+  }
   if (spec.flags & TRITON_NPU_PTSM) {
     const uint32_t factor = (spec.flags & TRITON_NPU_IAT) ? 4 : 64;
     const uint64_t otherPrograms =
@@ -182,7 +278,11 @@ inline LaunchGrid prepareGrid(const TritonNpuLaunchSpecV1 &spec,
     result.grid[0] =
         std::min((uint64_t(input[0]) + factor - 1) / factor, axisCap);
   }
-  if (spec.coalesce_factor > 1 && spec.coalesce_axis >= 0) {
+  if (spec.flags & TRITON_NPU_ATOMIC_REMOVE) {
+    if (result.grid[1] != 1 || result.grid[2] != 1)
+      throw std::invalid_argument("invalid grouped reduction launch");
+    result.grid[0] = std::min(uint32_t(result.grid[0]), spec.coalesce_factor);
+  } else if (spec.coalesce_factor > 1 && spec.coalesce_axis >= 0) {
     int64_t dim = result.grid[spec.coalesce_axis];
     if (spec.flags & TRITON_NPU_COALESCE_CEIL)
       dim = (dim + spec.coalesce_factor - 1) / spec.coalesce_factor;
@@ -196,13 +296,20 @@ inline LaunchGrid prepareGrid(const TritonNpuLaunchSpecV1 &spec,
   }
   uint64_t blocks = checkedMultiply(
       checkedMultiply(result.grid[0], result.grid[1]), result.grid[2]);
-  if (blocks > std::numeric_limits<uint32_t>::max())
-    throw std::overflow_error("launch grid exceeds uint32 block count");
+  // logicalBlocks keeps the full 64-bit program count: workspace sizing needs
+  // the true total and must not inherit the 32-bit block_dim limit.
+  if (spec.gridContractVersion == 3 && blocks > INT32_MAX)
+    throw std::overflow_error(
+        "block batching exceeds the G0 signed i32 task domain");
   result.logicalBlocks = blocks;
-  result.physicalBlocks =
+  // physicalBlocks is the value handed to CANN as block_dim and stays 32-bit.
+  const uint64_t physical =
       (spec.flags & TRITON_NPU_AUTO_MAP)
-          ? std::min(result.logicalBlocks, spec.physical_blocks)
+          ? std::min(result.logicalBlocks, uint64_t{spec.physical_blocks})
           : result.logicalBlocks;
+  if (physical > std::numeric_limits<uint32_t>::max())
+    throw std::overflow_error("launch grid exceeds uint32 block count");
+  result.physicalBlocks = static_cast<uint32_t>(physical);
   return result;
 }
 

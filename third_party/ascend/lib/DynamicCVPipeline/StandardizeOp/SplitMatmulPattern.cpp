@@ -34,7 +34,6 @@
 #include "llvm/Support/LogicalResult.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include "bishengir/Dialect/Utils/Util.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -53,15 +52,15 @@
 #include "mlir/Support/LLVM.h"
 
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Common.h"
 #include "ascend/include/DynamicCVPipeline/StandardizeOp/PatternMatchRewrites.h"
 
-#include "DynamicCVPipeline/PlanComputeBlock/Common.h"
 #include "bishengir/Dialect/HIVM/IR/HIVMImpl.h"
+#include "bishengir/Dialect/Utils/Util.h"
 
 using namespace llvm;
 using namespace mlir;
-using namespace triton;
-using namespace CVSplit;
+using namespace CVPipeline;
 
 static constexpr const char *DEBUG_TYPE = "SplitMatmul";
 #define LOG_DEBUG(...)                                                         \
@@ -489,6 +488,7 @@ static bool isOutputFilter(linalg::MatmulOp matmulOp, Value &outerOutValue,
   }
   return false;
 }
+
 static bool shouldSplitByOutput(linalg::MatmulOp matmulOp, Value &outerOutValue,
                                 Value &outerInValue) {
   if (isOutputFilter(matmulOp, outerOutValue, outerInValue)) {
@@ -546,6 +546,7 @@ static bool isInputFilter(linalg::MatmulOp matmulOp, Value &outerOutValue,
   }
   return false;
 }
+
 static bool shouldSplitByInput(linalg::MatmulOp matmulOp, Value &outerOutValue,
                                Value &outerInValue) {
   if (isInputFilter(matmulOp, outerOutValue, outerInValue)) {
@@ -555,8 +556,12 @@ static bool shouldSplitByInput(linalg::MatmulOp matmulOp, Value &outerOutValue,
   if (!outerInOp) {
     return true;
   }
+  if (isa<tensor::EmptyOp>(outerInOp)) {
+    return false;
+  }
 
-  if (operationIsFillZero(outerInValue.getDefiningOp())) {
+  if (operationIsFillZero(outerInValue.getDefiningOp()) ||
+      llvm::isa<tensor::EmptyOp>(outerInValue.getDefiningOp())) {
     LOG_DEBUG("Not split because bias is zero. " << matmulOp);
     return false;
   }
@@ -686,7 +691,8 @@ static std::optional<SplitInfo> shouldSplit(linalg::MatmulOp matmulOp,
   Value outerInValue = matmulInput.bias;
   auto outerOutValue = searchInArgsChain(
       matmulOp.getResult(0), argsLimitedInMatmul, mayNotExec, outerInValue);
-  if (utils::getAnnotateOpWithAttr(outerOutValue, kMatmulAtLeastOnceHint)
+  if (utils::getAnnotateOpWithAttr(outerOutValue,
+                                   CVPipeline::kMatmulAtLeastOnceHint)
           .has_value()) {
     mayNotExec = false;
   }
